@@ -874,7 +874,7 @@ private
     def convert_usernames_to_slack text
         users_map = get_users_map()
 
-        text = text.gsub(/@([a-zA-Z0-9][a-zA-Z0-9_\-]*)/) { |username| 
+        text = text.gsub(/@([a-zA-Z0-9][a-zA-Z0-9_\-.]*)/) { |username| 
             mention_user(Regexp.last_match[1])
         }
 
