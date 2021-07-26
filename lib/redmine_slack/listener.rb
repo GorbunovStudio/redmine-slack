@@ -181,17 +181,24 @@ class SlackListener < Redmine::Hook::Listener
 
 
         if progress_event && progress_event == SlackListener::PROGRESS_EVENT_STORY_READY_FOR_REVIEW
+            # Rails.logger.warn("Preparing review list")
             executor      = get_executor(issue)
-            executor_mention = executor.nil? ? "" : mention_user(executor.login)
 
-            msg = build_review_list(issue)
-            if !msg.blank?
-                speak msg, executor_mention, [{}], url
-            end
+            if !executor.nil?
+                executor_mention = get_slack_username(executor.login)
 
-            msg = build_assigned_list(issue)
-            if !msg.blank?
-                speak msg, executor_mention, [{}], url
+                if can_review_code(executor, issue.project)
+                    msg = build_review_list()
+
+                    if !msg.blank?
+                        speak msg, executor_mention, [{}], url
+                    end
+                end
+
+                msg = build_assigned_list()
+                if !msg.blank?
+                    speak msg, executor_mention, [{}], url
+                end
             end
         end
     end
@@ -331,6 +338,12 @@ private
         roles = user.roles_for_project(project).collect(&:id)
 
         return roles.include? 6 # Client representative
+    end
+
+    def can_review_code(user, project)
+        roles = user.roles_for_project(project).collect(&:id)
+
+        return roles.include? 10 # Code review
     end
 
     def prepare_issue_description(issue)
@@ -946,7 +959,7 @@ private
         return "• #{issue.project.name} - <#{object_url issue}|#{issue.tracker.name} ##{issue.id}: #{issue.subject}> (#{issue.status.name}) [#{issue.priority.name}]"
     end
 
-    def build_review_list(issue)
+    def build_review_list()
         reviewList = "*The following tasks are waiting for review:*\r\n"
 
         issues = get_issues_for_review()
@@ -969,7 +982,7 @@ private
         issues
     end
 
-    def build_assigned_list(issue)
+    def build_assigned_list()
         assignedList = "*The following tasks are waiting for your attention:*\r\n"
 
         issues = get_assigned_issues()        
