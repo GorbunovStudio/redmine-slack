@@ -741,7 +741,8 @@ private
 
     def get_executor(issue)
         field_id = CustomField.where(:name => "Исполнитель").first.id
-        value = issue.custom_value_for(field_id).value
+		value_object = issue.custom_value_for(field_id)
+        value = value_object.value if !value_object.nil? 
 
         if !value.blank?
             value = User.find(value)
@@ -754,7 +755,9 @@ private
 
     def get_reviewer(issue)
         field_id = CustomField.where(:name => "Ревьюер").first.id
-        value = issue.custom_value_for(field_id).value
+
+		value_object = issue.custom_value_for(field_id)
+        value = value_object.value if !value_object.nil? 
 
         if !value.blank?
             value = User.find(value)
@@ -782,9 +785,9 @@ private
 
     def get_returns_count(issue)
         field_id = CustomField.where(:name => "Returns count").first.id
-        valueObject = issue.custom_value_for(field_id)
+        value_object = issue.custom_value_for(field_id)
         value = 0
-        value = valueObject.value.to_i if !valueObject.nil?
+        value = value_object.value.to_i if !value_object.nil?
 
         return value        
     end
