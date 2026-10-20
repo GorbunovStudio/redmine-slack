@@ -1,4 +1,10 @@
 <p>
+	<label for="settings_delivery_enabled">Enable Slack delivery</label>
+	<%= hidden_field_tag 'settings[delivery_enabled]', '0' %>
+	<%= check_box_tag 'settings[delivery_enabled]', '1', settings['delivery_enabled'] == '1', id: 'settings_delivery_enabled' %>
+</p>
+
+<p>
 	<label for="settings_slack_url">Slack URL</label>
 	<input type="text" id="settings_slack_url" size=80 value="<%= settings['slack_url'] %>" name="settings[slack_url]" />
 </p>

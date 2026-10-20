@@ -27,6 +27,7 @@ Redmine::Plugin.register :redmine_slack do
 
 	settings \
 		:default => {
+			'delivery_enabled' => '0',
 			'callback_url' => 'http://slack.com/callback/',
 			'channel' => nil,
 			'icon' => 'https://raw.github.com/sciyoshi/redmine-slack/gh-pages/icon.png',

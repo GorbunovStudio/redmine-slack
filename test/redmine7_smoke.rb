@@ -22,7 +22,7 @@ class SlackWorkflowSmokeTest < ActionController::TestCase
 
   setup do
     raise 'Run only against the upgraded local db service' unless ActiveRecord::Base.connection_db_config.host == 'db'
-    raise 'Local Slack delivery must start disabled' unless ENV['REDMINE_SLACK_DELIVERY_ENABLED'] == '0'
+    raise 'Local Slack delivery must start disabled in plugin settings' if Setting.plugin_redmine_slack.with_indifferent_access[:delivery_enabled] == '1'
     @connection = ActiveRecord::Base.connection
     @connection.begin_transaction(joinable: false)
     @routes = Rails.application.routes
@@ -52,7 +52,6 @@ class SlackWorkflowSmokeTest < ActionController::TestCase
 
   teardown do
     @connection.rollback_transaction if @connection
-    ENV['REDMINE_SLACK_DELIVERY_ENABLED'] = '0'
     User.current = nil
     Setting.clear_cache
     SlackSmokeTransport.error = nil
@@ -305,29 +304,64 @@ class SlackUserAdminSmokeTest < SlackWorkflowSmokeTest
   end
 end
 
+class SlackSettingsSmokeTest < SlackWorkflowSmokeTest
+  tests SettingsController
+
+  def test_admin_controls_slack_delivery_in_plugin_settings
+    get :plugin, params: {id: 'redmine_slack'}
+    assert_response :success
+    assert_select 'input[type=hidden][name="settings[delivery_enabled]"][value="0"]'
+    assert_select '#settings_delivery_enabled[type=checkbox][value="1"]:not([checked])'
+    csrf_token = css_select('meta[name="csrf-token"]').first['content']
+
+    post :plugin, params: {id: 'redmine_slack', authenticity_token: csrf_token,
+      settings: Setting.plugin_redmine_slack.merge('delivery_enabled' => '1')}
+    assert_response :redirect
+    assert_equal '1', Setting.plugin_redmine_slack['delivery_enabled']
+    assert SlackListener.new.send(:delivery_enabled?)
+    get :plugin, params: {id: 'redmine_slack'}
+    assert_response :success
+    assert_select '#settings_delivery_enabled[checked]'
+
+    post :plugin, params: {id: 'redmine_slack', authenticity_token: csrf_token,
+      settings: Setting.plugin_redmine_slack.merge('delivery_enabled' => '0')}
+    assert_response :redirect
+    assert_equal '0', Setting.plugin_redmine_slack['delivery_enabled']
+    refute SlackListener.new.send(:delivery_enabled?)
+    assert_equal '1', Setting.plugin_redmine_slack['post_updates']
+    assert_empty SlackSmokeTransport.requests
+  end
+end
+
 class SlackDeliverySmokeTest < Minitest::Test
   def setup
     raise 'Run only against the upgraded local db service' unless ActiveRecord::Base.connection_db_config.host == 'db'
-    raise 'Local Slack delivery must start disabled' unless ENV['REDMINE_SLACK_DELIVERY_ENABLED'] == '0'
+    raise 'Local Slack delivery must start disabled in plugin settings' if Setting.plugin_redmine_slack.with_indifferent_access[:delivery_enabled] == '1'
     SlackSmokeTransport.requests.clear
     SlackSmokeTransport.status = 200
     SlackSmokeTransport.error = nil
     @listener = SlackListener.new
+    @delivery_settings = {}.with_indifferent_access
+    settings = @delivery_settings
+    @listener.define_singleton_method(:slack_settings) { settings }
   end
 
   def teardown
-    ENV['REDMINE_SLACK_DELIVERY_ENABLED'] = '0'
     SlackSmokeTransport.error = nil
     SlackSmokeTransport.status = 200
   end
 
   def test_disabled_switch_suppresses_all_requests
-    @listener.speak('Fixture', '#fixture', [], 'https://example.invalid/fixture')
-    assert_empty SlackSmokeTransport.requests
+    assert_equal '0', Redmine::Plugin.find(:redmine_slack).settings[:default]['delivery_enabled']
+    [nil, '0', 'false', true].each do |value|
+      @delivery_settings[:delivery_enabled] = value
+      @listener.speak('Fixture', '#fixture', [], 'https://example.invalid/fixture')
+      assert_empty SlackSmokeTransport.requests
+    end
   end
 
   def test_deliver_after_commit_and_discard_after_rollback
-    ENV['REDMINE_SLACK_DELIVERY_ENABLED'] = '1'
+    @delivery_settings[:delivery_enabled] = '1'
     ActiveRecord::Base.transaction do
       @listener.speak('Fixture committed', '#fixture', [], 'https://example.invalid/fixture')
       assert_empty SlackSmokeTransport.requests
@@ -342,8 +376,18 @@ class SlackDeliverySmokeTest < Minitest::Test
     assert_equal 1, SlackSmokeTransport.requests.length
   end
 
+  def test_delivery_disabled_before_commit_cancels_pending_notification
+    @delivery_settings[:delivery_enabled] = '1'
+    ActiveRecord::Base.transaction do
+      @listener.speak('Fixture cancelled', '#fixture', [], 'https://example.invalid/fixture')
+      assert_empty SlackSmokeTransport.requests
+      @delivery_settings[:delivery_enabled] = '0'
+    end
+    assert_empty SlackSmokeTransport.requests
+  end
+
   def test_transport_failures_do_not_raise_or_expose_endpoint
-    ENV['REDMINE_SLACK_DELIVERY_ENABLED'] = '1'
+    @delivery_settings[:delivery_enabled] = '1'
     SlackSmokeTransport.status = 429
     @listener.speak('Fixture rejected', '#fixture', [], 'https://example.invalid/fixture')
     assert_equal 1, SlackSmokeTransport.requests.length

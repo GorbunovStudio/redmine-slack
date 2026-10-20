@@ -235,7 +235,7 @@ class SlackListener
     end
 
     def speak(msg, channel, attachments=[], url=nil, icon_emoji=nil)
-        return unless ENV['REDMINE_SLACK_DELIVERY_ENABLED'] == '1'
+        return unless delivery_enabled?
         url = slack_settings[:slack_url] if not url
         return if url.blank? || channel.blank?
         username = slack_settings[:username]
@@ -263,11 +263,15 @@ class SlackListener
 
         payload = params.to_json
         ActiveRecord.after_all_transactions_commit do
-            deliver(url, payload) if ENV['REDMINE_SLACK_DELIVERY_ENABLED'] == '1'
+            deliver(url, payload) if delivery_enabled?
         end
     end
 
 private
+    def delivery_enabled?
+        slack_settings[:delivery_enabled] == '1'
+    end
+
     def slack_settings
         Setting.plugin_redmine_slack.with_indifferent_access
     end

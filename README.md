@@ -24,6 +24,24 @@ Restart Redmine, and you should see the plugin show up in the Plugins page.
 Under the configuration options, set the Slack API URL to the URL for an
 Incoming WebHook integration in your Slack account.
 
+## Delivery Control
+
+Open Administration > Plugins > Redmine Slack > Configure and select
+**Enable Slack delivery** to allow notifications. Delivery defaults to off,
+including for existing configurations that do not have this setting.
+The **Post Issue Updates** checkbox remains a separate notification-type choice.
+
+The plugin checks delivery before preparing a send and again after the database
+transaction commits. Disabling delivery also cancels a pending send. Changing
+the setting requires no image rebuild or application restart.
+
+Database backups include this setting. Keep it off on local and maintenance
+copies. To disable it from the upgraded Redmine root:
+
+```sh
+RAILS_ENV=production bundle exec rails runner 'Setting.plugin_redmine_slack = Setting.plugin_redmine_slack.merge("delivery_enabled" => "0")'
+```
+
 ## Customized Routing
 
 You can also route messages to different channels on a per-project basis. To
