@@ -1,6 +1,6 @@
 require 'httpclient'
 
-class SlackListener < Redmine::Hook::Listener
+class SlackListener
     include ERB::Util  
     include GravatarHelper::PublicMethods
 
@@ -84,9 +84,9 @@ class SlackListener < Redmine::Hook::Listener
         speak msg, channel, [attachment], url
     end  
 
-    def controller_issues_edit_before_save(context={})
+    def prepare_issue_update(context={})
         issue = context[:issue]
-        @previous_assigned_to = issue.assigned_to_was
+        @previous_assigned_to = User.find_by(id: issue.assigned_to_id_was)
         @previous_status_id   = issue.status_id_was
         @previous_priority_id = issue.priority_id_was
         @previous_returns_count = get_returns_count(issue)
@@ -103,15 +103,16 @@ class SlackListener < Redmine::Hook::Listener
         end
         
         @silent_update = false
-        if !journal.notes.blank? && journal.notes.start_with?("[silent-update]")
+        if journal && !journal.notes.blank? && journal.notes.start_with?("[silent-update]")
             @silent_update = true
             journal.notes.sub!(/^\[silent-update\]/, '')
         end
     end
 
-    def controller_issues_edit_after_save(context={})
+    def notify_issue_update(context={})
         issue = context[:issue]
-        journal = context[:journal]    
+        journal = context[:journal]
+        return unless journal && journal.user
 
         if (
             is_client(journal.user, issue.project) || 
@@ -125,7 +126,7 @@ class SlackListener < Redmine::Hook::Listener
         
         url = url_for_project issue.project
 
-        return unless channel and url and Setting.plugin_redmine_slack[:post_updates] == '1'
+        return unless channel and url and slack_settings[:post_updates] == '1'
 
         msg         = ""
         attachments = []
@@ -188,14 +189,14 @@ class SlackListener < Redmine::Hook::Listener
                 executor_mention = get_slack_username(executor.login)
 
                 if can_review_code(executor, issue.project)
-                    msg = build_review_list()
+                    msg = build_review_list(executor)
 
                     if !msg.blank?
                         speak msg, executor_mention, [{}], url
                     end
                 end
 
-                msg = build_assigned_list()
+                msg = build_assigned_list(executor)
                 if !msg.blank?
                     speak msg, executor_mention, [{}], url
                 end
@@ -226,16 +227,19 @@ class SlackListener < Redmine::Hook::Listener
         )
 
         attachment = {}
-        attachment[:text] = ll(Setting.default_language, :text_status_changed_by_changeset, "<#{revision_url}|#{escape changeset.comments}>")
+        attachment[:text] = I18n.t(:text_status_changed_by_changeset, locale: Setting.default_language, value: "<#{revision_url}|#{escape changeset.comments}>")
         attachment[:fields] = journal.details.map { |d| detail_to_field d }.compact
 
+        msg = "#{escape journal.user} updated <#{object_url issue}|#{escape issue}>"
         speak msg, channel, [attachment], url
     end
 
     def speak(msg, channel, attachments=[], url=nil, icon_emoji=nil)
-        url = Setting.plugin_redmine_slack[:slack_url] if not url
-        username = Setting.plugin_redmine_slack[:username]
-        icon = Setting.plugin_redmine_slack[:icon]
+        return unless ENV['REDMINE_SLACK_DELIVERY_ENABLED'] == '1'
+        url = slack_settings[:slack_url] if not url
+        return if url.blank? || channel.blank?
+        username = slack_settings[:username]
+        icon = slack_settings[:icon]
 
         params = {
             :text => msg,
@@ -257,13 +261,29 @@ class SlackListener < Redmine::Hook::Listener
 
         params[:icon_emoji] = icon_emoji if icon_emoji
 
-        client = HTTPClient.new
-        client.ssl_config.cert_store.set_default_paths
-        client.ssl_config.ssl_version = "SSLv23"
-        client.post url, {:payload => params.to_json}
+        payload = params.to_json
+        ActiveRecord.after_all_transactions_commit do
+            deliver(url, payload) if ENV['REDMINE_SLACK_DELIVERY_ENABLED'] == '1'
+        end
     end
 
 private
+    def slack_settings
+        Setting.plugin_redmine_slack.with_indifferent_access
+    end
+
+    def deliver(url, payload)
+        client = HTTPClient.new
+        client.ssl_config.cert_store.set_default_paths
+        client.connect_timeout = 5
+        client.send_timeout = 5
+        client.receive_timeout = 5
+        response = client.post(url, payload: payload)
+        Rails.logger.warn("Slack delivery rejected (HTTP #{response.status})") unless (200..299).cover?(response.status)
+    rescue StandardError => error
+        Rails.logger.warn("Slack delivery failed (#{error.class})")
+    end
+
     def prepare_users_map
         users = User.sorted.active.preload(:preference)
 
@@ -569,7 +589,7 @@ private
     def prepare_comment_message(issue, journal, channel, msg="")
         icon = nil
 
-        if journal.notes.blank? || @silent_update
+        if journal.private_notes? || journal.notes.blank? || @silent_update
            return msg, channel
         end
 
@@ -806,9 +826,9 @@ private
         cf = ProjectCustomField.find_by_name("Slack URL")
 
         return [
-            (proj.custom_value_for(cf).value rescue nil),
+            (proj.custom_field_value(cf.id) if cf),
             (url_for_project proj.parent),
-            Setting.plugin_redmine_slack[:slack_url],
+            slack_settings[:slack_url],
         ].find{|v| v.present?}
     end
 
@@ -818,9 +838,9 @@ private
         cf = ProjectCustomField.find_by_name("Slack Channel")
 
         val = [
-            (proj.custom_value_for(cf).value rescue nil),
+            (proj.custom_field_value(cf.id) if cf),
             (channel_for_project proj.parent),
-            Setting.plugin_redmine_slack[:channel],
+            slack_settings[:channel],
         ].find{|v| v.present?}
 
         if val.to_s.starts_with? '#'
@@ -836,7 +856,7 @@ private
         cf = ProjectCustomField.find_by_name("Slack Support Channel")
 
         val = [
-            (proj.custom_value_for(cf).value rescue nil),
+            (proj.custom_field_value(cf.id) if cf),
             (support_channel_for_project proj.parent),
             (channel_for_project proj),            
         ].find{|v| v.present?}
@@ -962,10 +982,10 @@ private
         return "• #{issue.project.name} - <#{object_url issue}|#{issue.tracker.name} ##{issue.id}: #{issue.subject}> (#{issue.status.name}) [#{issue.priority.name}]"
     end
 
-    def build_review_list()
+    def build_review_list(recipient = User.current)
         reviewList = "*The following tasks are waiting for review:*\r\n"
 
-        issues = get_issues_for_review()
+        issues = get_issues_for_review(recipient)
         if issues.blank? 
             return ''
         end
@@ -979,16 +999,14 @@ private
         return reviewList
     end
 
-    def get_issues_for_review
-        ir_query = IssueQuery.find(8)
-        issues = ir_query.issues
-        issues
+    def get_issues_for_review(recipient = User.current)
+        issues_for_recipient(8, recipient)
     end
 
-    def build_assigned_list()
+    def build_assigned_list(recipient = User.current)
         assignedList = "*The following tasks are waiting for your attention:*\r\n"
 
-        issues = get_assigned_issues()        
+        issues = get_assigned_issues(recipient)
         if issues.blank?
             return ''
         end
@@ -1002,14 +1020,40 @@ private
         return assignedList
     end
 
-    def get_assigned_issues
-        ir_query = IssueQuery.find(4)
-        issues = ir_query.issues[0..9]
-        if issues.blank? 
-            return ''
-        end
-
-        issues
+    def get_assigned_issues(recipient = User.current)
+        issues_for_recipient(4, recipient).first(10)
     end
 
+    def issues_for_recipient(query_id, recipient)
+        previous_user = User.current
+        User.current = recipient
+        IssueQuery.find(query_id).issues
+    ensure
+        User.current = previous_user
+    end
+
+end
+
+class SlackHook < Redmine::Hook::Listener
+    def controller_issues_new_after_save(context={})
+        SlackListener.new.controller_issues_new_after_save(context)
+    end
+
+    def controller_issues_edit_before_save(context={})
+        listener = SlackListener.new
+        context.fetch(:issue).instance_variable_set(:@redmine_slack_listener, listener)
+        listener.prepare_issue_update(context)
+    end
+
+    def controller_issues_edit_after_save(context={})
+        issue = context.fetch(:issue)
+        listener = issue.instance_variable_get(:@redmine_slack_listener) || SlackListener.new
+        listener.notify_issue_update(context)
+    ensure
+        issue&.remove_instance_variable(:@redmine_slack_listener) if issue&.instance_variable_defined?(:@redmine_slack_listener)
+    end
+
+    def model_changeset_scan_commit_for_issue_ids_pre_issue_update(context={})
+        SlackListener.new.model_changeset_scan_commit_for_issue_ids_pre_issue_update(context)
+    end
 end
