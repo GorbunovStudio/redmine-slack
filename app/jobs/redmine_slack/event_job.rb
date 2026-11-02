@@ -4,6 +4,8 @@ module RedmineSlack
     self.enqueue_after_transaction_commit = false
     self.log_arguments = false
 
+    retry_on ActiveRecord::StaleObjectError
+
     retry_on ::RedmineSlack::TransientError do |_job, error|
       Rails.logger.warn("Slack event exhausted (#{error.message})")
     end
@@ -34,7 +36,8 @@ module RedmineSlack
       return if event['user'].blank?
 
       client = ::RedmineSlack::Client.new(settings[:bot_token])
-      target = ::RedmineSlack::InboundMessage.new(event['text']).marker
+      message = ::RedmineSlack::InboundMessage.new(event['text'])
+      target = message.marker
       if !target && event['thread_ts'].present?
         parent = client.conversation_parent(event['channel'], event['thread_ts'])
         if parent
@@ -44,7 +47,7 @@ module RedmineSlack
       end
       ::RedmineSlack::CommentImporter.new(client, import_user).create(event, target) if target
 
-      references = ::RedmineSlack::InboundMessage.new(event['text']).preview_references
+      references = message.preview_references
       attachments = references.filter_map do |id|
         issue = Issue.find_by(id: id)
         next unless issue && issue.visible?(import_user)

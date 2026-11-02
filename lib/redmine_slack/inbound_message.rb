@@ -99,17 +99,19 @@ module RedmineSlack
         leading + body + trailing
       end
 
-      def inline(element)
+      def inline(element, remove_marker = true)
         type = element['type']
         case type
         when 'text'
-          styled(consume_marker(element['text'].to_s), element['style'])
+          text = element['text'].to_s
+          styled(remove_marker ? consume_marker(text) : text, element['style'])
         when 'link'
           url = element['url'].to_s
+          destination = url.gsub('&', '&amp;').gsub('\\') { '\\\\' }
           if element['text'].to_s.empty?
-            return url.match?(/[ <>]/) ? "[#{literal(url)}](<#{url}>)" : "<#{url}>"
+            return url.match?(/[ <>\\]/) ? "[#{literal(url)}](<#{destination}>)" : "<#{destination}>"
           end
-          destination = url.match?(/[ ()]/) ? "<#{url}>" : url
+          destination = "<#{destination}>" if url.match?(/[ ()]/)
           "[#{styled(element['text'], element['style'])}](#{destination})"
         when 'user'
           user = @resolver.user(element['user_id'])
@@ -142,7 +144,30 @@ module RedmineSlack
         elements = Array(element['elements'])
         case element['type']
         when 'rich_text_section'
-          elements.map { |item| inline(item) }.join.sub(/\n\z/, '')
+          merged = []
+          elements.each do |item|
+            if item['type'] == 'text'
+              item = item.merge('text' => consume_marker(item['text'].to_s))
+              style = item['style'] || {}
+              previous = merged.last
+              previous_style = previous && (previous['style'] || {})
+              same_style = previous && previous['type'] == 'text' &&
+                (style['code'] && previous_style['code'] ||
+                  !style['code'] && !previous_style['code'] && %w[bold italic strike].all? { |key| !!style[key] == !!previous_style[key] })
+              if same_style
+                previous['text'] += item['text']
+                next
+              end
+            end
+            merged << item
+          end
+          parts = merged.map { |item| inline(item, false) }
+          parts.each_index do |index|
+            if merged[index]['type'] == 'text' && parts[index].end_with?('!') && merged[index + 1]&.[]('type') == 'link' && parts[index + 1].start_with?('[')
+              parts[index] = parts[index].sub(/!\z/, '\\!')
+            end
+          end
+          parts.join.sub(/\n\z/, '')
         when 'rich_text_preformatted'
           content = elements.map { |item| item['type'] == 'text' ? consume_marker(item['text'].to_s) : (item['text'] || item['url']).to_s }.join
           fence = '`' * [content.scan(/`+/).map(&:length).max.to_i + 1, 3].max
@@ -152,7 +177,9 @@ module RedmineSlack
         when 'rich_text_list'
           elements.each_with_index.map do |item, index|
             prefix = element['style'] == 'ordered' ? "#{element.fetch('offset', 0).to_i + index + 1}. " : '- '
-            (' ' * (element.fetch('indent', 0).to_i * 4)) + prefix + structure(item)
+            indentation = ' ' * (element.fetch('indent', 0).to_i * 4)
+            lines = structure(item).split("\n", -1)
+            indentation + prefix + lines.first.to_s + lines.drop(1).map { |line| line.empty? ? "\n" : "\n#{indentation}#{' ' * prefix.length}#{line}" }.join
           end.join("\n")
         else
           ''

@@ -2,6 +2,7 @@ module RedmineSlack
   class MemberResolver
     def initialize(client)
       @client = client
+      @user_info = {}
     end
 
     def member(user_id)
@@ -39,7 +40,7 @@ module RedmineSlack
         return user if user
         Rails.cache.delete(key)
       end
-      email = @client.user_info(member_id).dig('user', 'profile', 'email')
+      email = user_info(member_id).dig('user', 'profile', 'email')
       return nil if email.blank?
       user = User.active.having_mail(email).first
       Rails.cache.write(key, user.id, expires_in: 24.hours) if user
@@ -47,8 +48,14 @@ module RedmineSlack
     end
 
     def display_name(member_id)
-      profile = @client.user_info(member_id)['user'] || {}
+      profile = user_info(member_id)['user'] || {}
       profile.dig('profile', 'display_name').presence || profile.dig('profile', 'real_name').presence || profile['name'].presence || member_id
+    end
+
+    private
+
+    def user_info(member_id)
+      @user_info[member_id] ||= @client.user_info(member_id)
     end
   end
 end

@@ -23,7 +23,7 @@ module RedmineSlack
         author_name = @resolver.display_name(event['user'])
       end
       text = InboundMessage.new(event['text'], event['blocks']).convert(@resolver).strip
-      notes = author_name ? ["**#{author_name}** (Slack):", text.presence].compact.join("\n") : text
+      notes = attributed_notes(author_name, text)
       previous_user = User.current
       User.current = author
       MessageLink.transaction do
@@ -60,7 +60,7 @@ module RedmineSlack
         journal = Journal.find_by(id: link.journal_id)
         next unless journal
         text = InboundMessage.new(message['text'], message['blocks']).convert(@resolver).strip
-        notes = link.author_name.present? ? ["**#{link.author_name}** (Slack):", text.presence].compact.join("\n") : text
+        notes = attributed_notes(link.author_name, text)
         journal.update!(notes: notes)
         link.update!(last_edited_ts: timestamp)
       end
@@ -75,7 +75,7 @@ module RedmineSlack
         next if link.deleted_at
         journal = Journal.find_by(id: link.journal_id) if link.journal_id
         if journal
-          old_notes = journal.notes.to_s.lines.map { |line| line.chomp.blank? ? line : "~~#{line.chomp}~~#{line.end_with?("\n") ? "\n" : ''}" }.join
+          old_notes = journal.notes.to_s.lines.map { |line| line.chomp.blank? ? ">#{line.end_with?("\n") ? "\n" : ''}" : "> #{line}" }.join
           heading = "_Deleted in Slack on #{ApplicationController.helpers.format_time(deleted_at)}_"
           journal.update!(notes: "#{heading}\n\n#{old_notes}")
         end
@@ -83,6 +83,12 @@ module RedmineSlack
       end
     rescue ActiveRecord::RecordNotUnique
       retry
+    end
+
+    private
+
+    def attributed_notes(author_name, text)
+      author_name.present? ? ["**#{author_name}** (Slack):", text.presence].compact.join("\n\n") : text
     end
   end
 end

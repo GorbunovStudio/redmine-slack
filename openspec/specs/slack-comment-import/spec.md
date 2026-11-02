@@ -71,6 +71,7 @@ Imported notes SHALL render the message's `rich_text` blocks in order, ignoring 
 - **WHEN** a rich-text text element contains characters meaningful to CommonMark
 - **THEN** backslash, backtick, asterisk, underscore, tilde, square brackets, angle brackets, and pipe are backslash-escaped everywhere, and an ampersand starting an entity-like sequence is backslash-escaped
 - **AND** at line start, `#`, `-`, `+`, `=`, `>` and an ordered-list number's `.` or `)` are escaped where they would introduce formatting
+- **AND** a literal `!` immediately preceding a generated link is escaped so it does not create an image
 - **AND** other characters remain as typed, including `#123`, `@login`, `/`, and ordinary `.`, preserving readable note source and Redmine issue links and mentions
 - **AND** Redmine's rendered HTML displays `# TODO later`, `text` followed by `---`, `__init__`, `2*3*4`, `<div>`, and entity-like text literally rather than as headings, rules, emphasis, HTML, or decoded entities
 
@@ -214,11 +215,11 @@ A `message_changed` event SHALL rewrite the linked journal's notes only when it 
 - **THEN** it makes no journal change and does not create a comment
 
 ### Requirement: Retain deleted comments as marked history
-A `message_deleted` event SHALL locate its message by `deleted_ts`, set `deleted_at`, and replace linked notes with `_Deleted in Slack on <date and time>_`, a blank line, then the prior text with each nonblank line wrapped in `~~…~~`. Attachments MUST remain; repeated deletion MUST NOT wrap the note again, and subsequent edits MUST be ignored.
+A `message_deleted` event SHALL locate its message by `deleted_ts`, set `deleted_at`, and replace linked notes with `_Deleted in Slack on <date and time>_`, a blank line, then the prior text as a quote with each line prefixed by `> ` (blank lines by `>`). Attachments MUST remain; repeated deletion MUST NOT quote the note again, and subsequent edits MUST be ignored.
 
 #### Scenario: Delete a multiline imported note
 - **WHEN** Slack deletes an imported comment containing multiple paragraphs
-- **THEN** the journal retains its attachments and shows the italic deletion line followed by line-wise strikethrough, preserving blank lines
+- **THEN** the journal retains its attachments and shows the italic deletion line followed by the prior note in a blockquote, preserving blank lines and visible rich-text content
 
 #### Scenario: Delete before import arrives
 - **WHEN** a deletion arrives for a message with no link

@@ -300,16 +300,19 @@ class SlackMemberSmokeTest < SlackWorkflowSmokeTest
     assert_equal @user.id, resolver.user('UEMAIL').id
     assert_equal 1, SlackSmokeTransport.requests.size
     assert_equal 'Fixture Name', resolver.display_name('UEMAIL')
+    assert_equal 1, SlackSmokeTransport.requests.size
     SlackSmokeTransport.body = '{"ok":true,"user":{"profile":{}}}'
     2.times { assert_nil resolver.user('UNMATCHED') }
-    assert_equal 4, SlackSmokeTransport.requests.size
+    assert_equal 2, SlackSmokeTransport.requests.size
+    assert_nil RedmineSlack::MemberResolver.new(RedmineSlack::Client.new('fixture-token')).user('UNMATCHED')
+    assert_equal 3, SlackSmokeTransport.requests.size
     SlackSmokeTransport.body = '{"ok":false,"error":"invalid_auth"}'
     2.times { assert_raises(RedmineSlack::DropError) { resolver.user('UFAILURE') } }
     assert_nil Rails.cache.read(['redmine_slack', 'reverse_member', 'UFAILURE'])
     travel 24.hours + 1.second do
       SlackSmokeTransport.body = {ok: true, user: {profile: {email: @user.mail}}}.to_json
       assert_equal @user.id, resolver.user('UEMAIL').id
-      assert_equal 7, SlackSmokeTransport.requests.size
+      assert_equal 5, SlackSmokeTransport.requests.size
     end
     @user.update_columns(status: User::STATUS_LOCKED)
     SlackSmokeTransport.body = {ok: true, user: {profile: {email: @user.mail}}}.to_json
@@ -454,6 +457,30 @@ class SlackInboundMessageSmokeTest < SlackWorkflowSmokeTest
     assert_empty SlackSmokeTransport.requests
   end
 
+  def test_rich_text_link_boundaries_destinations_and_adjacent_styles
+    url = 'https://example.invalid/?x=&copy;'
+    backslash_url = 'https://example.invalid/a\\_b'
+    elements = [rich_text('!'), {'type' => 'link', 'url' => url, 'text' => 'label'}, rich_text(' '),
+      {'type' => 'link', 'url' => url}, rich_text(' '), {'type' => 'link', 'url' => backslash_url, 'text' => 'backslash'}, rich_text(' '),
+      {'type' => 'link', 'url' => backslash_url}, rich_text(' '), rich_text('abc', {'bold' => true}), rich_text('def', {'bold' => true}), rich_text(' '),
+      rich_text('one`two', {'code' => true}), rich_text('three', {'code' => true, 'bold' => true})]
+    fragment = Nokogiri::HTML.fragment(html(RedmineSlack::InboundMessage.new('', rich_blocks(rich_section(*elements))).convert(Object.new)))
+    assert_equal [url, url, 'https://example.invalid/a%5C_b', 'https://example.invalid/a%5C_b'], fragment.css('a').map { |link| link['href'] }
+    assert_includes fragment.text, '!label'
+    refute fragment.at_css('img')
+    assert_equal 'abcdef', fragment.at_css('strong').text
+    assert_equal 'one`twothree', fragment.at_css('code').text
+  end
+
+  def test_rich_text_list_item_continuation_paragraphs
+    list = {'type' => 'rich_text_list', 'style' => 'bullet', 'elements' => [rich_section(rich_text("first\n\nsecond")), rich_section(rich_text('third'))]}
+    fragment = Nokogiri::HTML.fragment(html(RedmineSlack::InboundMessage.new('', rich_blocks(list)).convert(Object.new)))
+    assert_equal 1, fragment.css('ul').size
+    assert_equal 2, fragment.css('ul > li').size
+    assert_equal %w[first second], fragment.css('ul > li').first.css('p').map(&:text)
+    assert_equal 'third', fragment.css('ul > li').last.text.strip
+  end
+
   def test_rich_text_structures_and_marker
     section = ->(text) { rich_section(rich_text(text)) }
     list = ->(style, indent, texts, offset = 0) { {'type' => 'rich_text_list', 'style' => style, 'indent' => indent, 'offset' => offset, 'elements' => texts.map { |text| section.call(text) }} }
@@ -591,6 +618,54 @@ class SlackEventJobSmokeTest < SlackWorkflowSmokeTest
     Issue.singleton_class.remove_method(:find_by)
   end
 
+  def test_stale_issue_is_retried_and_imported_once
+    ActiveJob::Base.queue_adapter = :test
+    @user.rslack_preference[:username] = 'ULINKED01'
+    event = @event.merge('ts' => '189.001', 'user' => 'ULINKED01', 'text' => "##{@issue.id}+= retry")
+    Issue.where(id: @issue.id).update_all(lock_version: @issue.lock_version + 1)
+    assert_no_difference ['Journal.count', 'RedmineSlack::MessageLink.count'] do
+      with_issue_lookup(@issue) { RedmineSlack::EventJob.perform_now(event) }
+    end
+    jobs = ActiveJob::Base.queue_adapter.enqueued_jobs.select { |job| job[:job] == RedmineSlack::EventJob }
+    assert_equal 1, jobs.size
+    assert_difference ['Journal.count', 'RedmineSlack::MessageLink.count'], 1 do
+      ActiveJob::Base.execute(jobs.first)
+      RedmineSlack::EventJob.perform_now(event)
+    end
+    assert_equal 'retry', Journal.find(RedmineSlack::MessageLink.find_by!(message_ts: event['ts']).journal_id).notes
+  end
+
+  def test_deleted_rich_history_remains_visible_in_quote
+    @user.rslack_preference[:username] = 'ULINKED01'
+    body = "~~struck history~~\n\n```\ncode first\ncode second\n```\n\n- list one\n- list two"
+    event = @event.merge('ts' => '188.001', 'user' => 'ULINKED01', 'text' => "##{@issue.id}+= #{body}")
+    RedmineSlack::EventJob.perform_now(event)
+    journal = Journal.find(RedmineSlack::MessageLink.find_by!(message_ts: event['ts']).journal_id)
+    RedmineSlack::EventJob.perform_now(@event.merge('subtype' => 'message_deleted', 'deleted_ts' => event['ts'], 'event_ts' => '188.002'))
+    fragment = Nokogiri::HTML.fragment(html(journal.reload.notes))
+    assert_match(/Deleted in Slack on/, fragment.at_css('p > em').text)
+    quote = fragment.at_css('blockquote')
+    ['struck history', 'code first', 'code second', 'list one', 'list two'].each { |text| assert_includes quote.text, text }
+    assert_equal 'struck history', quote.at_css('del').text
+    assert quote.at_css('pre code')
+    assert_equal 2, quote.css('li').size
+  end
+
+  def test_fallback_author_offset_list_on_create_and_edit
+    @user.define_singleton_method(:member_of?) { |_project| true }
+    SlackSmokeTransport.body = '{"ok":true,"user":{"profile":{"display_name":"Outside Person"}}}'
+    list = {'type' => 'rich_text_list', 'style' => 'ordered', 'offset' => 2, 'elements' => [rich_section(rich_text('third')), rich_section(rich_text('fourth'))]}
+    event = @event.merge('ts' => '187.001', 'user' => 'UOUTSIDE', 'text' => "##{@issue.id}+= list", 'blocks' => rich_blocks(list))
+    RedmineSlack::EventJob.perform_now(event)
+    journal = Journal.find(RedmineSlack::MessageLink.find_by!(message_ts: event['ts']).journal_id)
+    assert_equal '3', Nokogiri::HTML.fragment(html(journal.notes)).at_css('ol')['start']
+    change = @event.merge('subtype' => 'message_changed', 'message' => {'ts' => event['ts'], 'text' => 'edited', 'blocks' => rich_blocks(list), 'edited' => {'ts' => '187.002'}})
+    RedmineSlack::EventJob.perform_now(change)
+    fragment = Nokogiri::HTML.fragment(html(journal.reload.notes))
+    assert_equal 'Outside Person', fragment.at_css('strong').text
+    assert_equal '3', fragment.at_css('ol')['start']
+  end
+
   def test_rich_text_create_edit_attribution_routing_and_previews
     @user.define_singleton_method(:member_of?) { |_project| true }
     other = Issue.where.not(id: @issue.id).first!
@@ -711,7 +786,7 @@ class SlackEventJobSmokeTest < SlackWorkflowSmokeTest
     assert_equal "edited\n\nnext", journal.reload.notes
     deletion = @event.merge('subtype' => 'message_deleted', 'deleted_ts' => '123.456', 'event_ts' => '123.458')
     RedmineSlack::EventJob.perform_now(deletion)
-    assert_match(/\A_Deleted in Slack on .*_\n\n~~edited~~\n\n~~next~~\z/, journal.reload.notes)
+    assert_match(/\A_Deleted in Slack on .*_\n\n> edited\n>\n> next\z/, journal.reload.notes)
     deleted_notes = journal.notes
     RedmineSlack::EventJob.perform_now(deletion)
     changed['message']['edited']['ts'] = '123.459'
@@ -766,7 +841,7 @@ class SlackEventJobSmokeTest < SlackWorkflowSmokeTest
     change = @event.merge('subtype' => 'message_changed', 'message' => {'ts' => event['ts'], 'text' => '#999999999+= changed', 'edited' => {'ts' => '180.000000000000000002'}})
     SlackSmokeTransport.requests.clear
     RedmineSlack::EventJob.perform_now(change)
-    assert_equal "**Outside Person** (Slack):\nchanged", journal.reload.notes
+    assert_equal "**Outside Person** (Slack):\n\nchanged", journal.reload.notes
     assert_equal [original_issue_id, original_user_id], [journal.journalized_id, journal.user_id]
     assert_equal '180.000000000000000002', link.reload.last_edited_ts
     assert_empty SlackSmokeTransport.requests
@@ -775,7 +850,7 @@ class SlackEventJobSmokeTest < SlackWorkflowSmokeTest
       change['message']['text'] = 'stale'
       RedmineSlack::EventJob.perform_now(change)
     end
-    assert_equal "**Outside Person** (Slack):\nchanged", journal.reload.notes
+    assert_equal "**Outside Person** (Slack):\n\nchanged", journal.reload.notes
     change['message']['ts'] = 'missing'
     change['message']['edited']['ts'] = '181.0'
     assert_no_difference ['Journal.count', 'RedmineSlack::MessageLink.count'] do
@@ -802,7 +877,7 @@ class SlackEventJobSmokeTest < SlackWorkflowSmokeTest
     @user.define_singleton_method(:member_of?) { |_project| true }
     importer.create(event, @issue.id)
     link = RedmineSlack::MessageLink.find_by!(message_ts: 'fallback.1')
-    assert_equal "**Outside Person** (Slack):\nfixture", Journal.find(link.journal_id).notes
+    assert_equal "**Outside Person** (Slack):\n\nfixture", Journal.find(link.journal_id).notes
     assert_equal 'Outside Person', link.author_name
   end
 
@@ -818,7 +893,7 @@ class SlackEventJobSmokeTest < SlackWorkflowSmokeTest
     with_issue_lookup(@issue) { importer.create(event, @issue.id) }
     journal = Journal.find(RedmineSlack::MessageLink.find_by!(message_ts: '160.001').journal_id)
     assert_equal @user.id, journal.user_id
-    assert_equal "**Denied Author** (Slack):\nbody", journal.notes
+    assert_equal "**Denied Author** (Slack):\n\nbody", journal.notes
     [[:visible?, false], [:notes_addable?, false]].each_with_index do |(method, _), index|
       @issue.define_singleton_method(:visible?) { |_user| false } if method == :visible?
       if method == :notes_addable?
@@ -900,7 +975,7 @@ class SlackEventJobSmokeTest < SlackWorkflowSmokeTest
     @user.define_singleton_method(:member_of?) { |_project| true }
     importer = RedmineSlack::CommentImporter.new(RedmineSlack::Client.new('fixture-token'), @user)
     info = '{"ok":true,"user":{"profile":{"display_name":"Outside Person"}}}'
-    SlackSmokeTransport.responses = [[200, info, {}], [200, info, {}], [200, 'ok'.b, {}]]
+    SlackSmokeTransport.responses = [[200, info, {}], [200, 'ok'.b, {}]]
     importer.create(event.merge('ts' => '151.002', 'user' => 'UOUTSIDE'), @issue.id)
     fallback = Journal.find(RedmineSlack::MessageLink.find_by!(message_ts: '151.002').journal_id)
     assert_equal '**Outside Person** (Slack):', fallback.notes
@@ -1493,7 +1568,7 @@ class SlackEventsSmokeTest < ActionDispatch::IntegrationTest
       case index
       when 0 then assert_equal 'original', journal.notes
       when 1 then assert_equal 'edited', journal.notes
-      when 2 then assert_match(/\A_Deleted in Slack on .*_\n\n~~edited~~\z/, journal.notes)
+      when 2 then assert_match(/\A_Deleted in Slack on .*_\n\n> edited\z/, journal.notes)
       end
     end
     assert_empty SlackSmokeTransport.requests
