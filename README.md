@@ -24,13 +24,19 @@ Install `00_gorbunovstudio_background_jobs` version `1.1.0` or newer at
 `plugins/00_gorbunovstudio_background_jobs` before this plugin at
 `plugins/redmine_slack`. This plugin reserves one thread using the background
 jobs dedicated `slack` queue hook; it does not change the shared thread budget.
-The migration adds no gem, table, or schema migration. Restart Redmine after
-installing or upgrading the plugins so that the queue registration takes effect.
+Run the plugin migration from the Redmine root to create the Slack message link
+table, then restart Redmine so that queue registration takes effect:
+
+```sh
+RAILS_ENV=production bundle exec rake redmine:plugins:migrate NAME=redmine_slack
+```
 
 Create a Slack app, install it in the workspace, and grant these bot scopes:
 `chat:write`, `chat:write.customize`, `users:read.email`, `im:write`, `files:write`, and
 `groups:read` (used only for channel conversion). `chat:write.public` is not
-required. Scope changes require reinstalling the app. Enable the App Home Messages Tab; replies can remain disabled.
+required. Scope changes require reinstalling the app. Enable the App Home Messages
+Tab; replies can remain disabled for outbound-only use, but enable them to use
+inbound app DMs.
 See Slack's documentation for [posting](https://docs.slack.dev/reference/methods/chat.postMessage/),
 [email lookup](https://docs.slack.dev/reference/methods/users.lookupByEmail/),
 [opening DMs](https://docs.slack.dev/reference/methods/conversations.open/), and
@@ -45,6 +51,28 @@ Keep delivery disabled until conversion and a separately approved live test.
 Users or administrators can set a Slack member ID (`U…` or `W…`) in the
 existing Slack preference as an override. Otherwise delivery looks up the
 current Redmine email. Legacy preference values remain unchanged.
+
+## Slack event import
+
+For inbound use, configure the Events API request URL as
+`https://redmine.optimuspro.ru/redmine_slack/events`. Enter the app signing secret
+in **Slack signing secret** before Slack verifies the URL; the empty field
+preserves the existing secret and its status shows whether one is configured.
+Subscribe to bot events `message.groups` and `message.im`, add bot scopes
+`groups:history`, `im:history`, `files:read`, and `users:read`, and reinstall the
+app. Processing covers private channels containing the app and app DMs, not
+public channels, group DMs, or person-to-person DMs.
+
+Create an active Redmine user for Slack imports and select it as **Slack import
+user**. Add it to each relevant project with permission to view issues and add
+notes, and attachment access where files are expected. **Enable Slack import**
+defaults off and is independent of outbound delivery; keep it off until the
+cutover. When enabling it, disable only Hubot's preview, thread, and `#N+=`
+listeners; leave Hubot's other commands and scheduled reports running.
+
+For inbound rollback, disable import and leave the event job in place until
+queued work has consumed the disabled state. Remove the Slack subscription before
+removing the endpoint or job; retain message links, comments, and attachments.
 
 ## Delivery Control
 

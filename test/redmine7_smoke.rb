@@ -30,10 +30,11 @@ module SlackSmokeTransport
   end
 
   def capture(method, url, body, headers)
-    allowed = {'GET' => %w[users.lookupByEmail conversations.list], 'POST' => %w[conversations.open chat.postMessage files.getUploadURLExternal files.completeUploadExternal]}
+    allowed = {'GET' => %w[users.lookupByEmail users.info conversations.list conversations.history], 'POST' => %w[conversations.open chat.postMessage files.getUploadURLExternal files.completeUploadExternal]}
     endpoint = url.to_s.split('?').first
     synthetic_upload = method == 'POST' && url.to_s == 'https://upload.example.invalid/synthetic'
-    raise 'Unexpected HTTP request' unless synthetic_upload || allowed.fetch(method).any? { |name| endpoint == "https://slack.com/api/#{name}" }
+    synthetic_file = method == 'GET' && url.to_s == 'https://files.slack.com/synthetic-file'
+    raise 'Unexpected HTTP request' unless synthetic_upload || synthetic_file || allowed.fetch(method).any? { |name| endpoint == "https://slack.com/api/#{name}" }
     raise SlackSmokeTransport.error if SlackSmokeTransport.error
     SlackSmokeTransport.requests << {method: method, url: url.to_s, body: body, headers: headers}
     response = SlackSmokeTransport.responses&.shift
@@ -262,6 +263,44 @@ class SlackMemberSmokeTest < SlackWorkflowSmokeTest
     Rails.cache = ActiveSupport::Cache::MemoryStore.new
   end
 
+  def test_reverse_identity_prefers_preference_and_caches_successful_email_matches
+    resolver = RedmineSlack::MemberResolver.new(RedmineSlack::Client.new('fixture-token'))
+    @executor.rslack_preference[:username] = 'UPREFERRED'
+    @executor.preference.save!
+    assert_equal @executor.id, resolver.user('UPREFERRED').id
+    assert_empty SlackSmokeTransport.requests
+    locked = User.active.where.not(id: @user.id).first!
+    original_preference = locked.rslack_preference[:username]
+    locked.rslack_preference[:username] = 'ULOCKEDPREF'
+    locked.update_columns(status: User::STATUS_LOCKED)
+    SlackSmokeTransport.body = {ok: true, user: {profile: {email: @user.mail}}}.to_json
+    assert_equal @user.id, resolver.user('ULOCKEDPREF').id
+    locked.update_columns(status: User::STATUS_ACTIVE)
+    locked.rslack_preference[:username] = original_preference
+    SlackSmokeTransport.requests.clear
+    SlackSmokeTransport.body = {ok: true, user: {profile: {email: @user.mail.upcase, display_name: 'Fixture Name'}}}.to_json
+    assert_equal @user.id, resolver.user('UEMAIL').id
+    assert_equal @user.id, resolver.user('UEMAIL').id
+    assert_equal 1, SlackSmokeTransport.requests.size
+    assert_equal 'Fixture Name', resolver.display_name('UEMAIL')
+    SlackSmokeTransport.body = '{"ok":true,"user":{"profile":{}}}'
+    2.times { assert_nil resolver.user('UNMATCHED') }
+    assert_equal 4, SlackSmokeTransport.requests.size
+    SlackSmokeTransport.body = '{"ok":false,"error":"invalid_auth"}'
+    2.times { assert_raises(RedmineSlack::DropError) { resolver.user('UFAILURE') } }
+    assert_nil Rails.cache.read(['redmine_slack', 'reverse_member', 'UFAILURE'])
+    travel 24.hours + 1.second do
+      SlackSmokeTransport.body = {ok: true, user: {profile: {email: @user.mail}}}.to_json
+      assert_equal @user.id, resolver.user('UEMAIL').id
+      assert_equal 7, SlackSmokeTransport.requests.size
+    end
+    @user.update_columns(status: User::STATUS_LOCKED)
+    SlackSmokeTransport.body = {ok: true, user: {profile: {email: @user.mail}}}.to_json
+    assert_nil resolver.user('ULOCKEDEMAIL')
+    assert_nil Rails.cache.read(['redmine_slack', 'reverse_member', 'ULOCKEDEMAIL'])
+    assert_equal 'UPREFERRED', @executor.reload.rslack_preference[:username]
+  end
+
   def test_current_identity_and_literal_text
     resolver = RedmineSlack::MemberResolver.new(RedmineSlack::Client.new('fixture-token'))
     reference = RedmineSlack::MessageTemplate.mention(@executor)
@@ -335,6 +374,385 @@ class SlackMemberSmokeTest < SlackWorkflowSmokeTest
     @listener.define_singleton_method(:get_executor) { |_issue| executor }
     message, = @listener.send(:prepare_comment_message, @issue, journal, '#fixture-main')
     assert_equal 1, message.count { |part| part.is_a?(Hash) && part['redmine_user_id'] == @executor.id }
+  end
+end
+
+class SlackInboundMessageSmokeTest < SlackWorkflowSmokeTest
+  def test_parent_lookup_and_binary_download_restrictions
+    client = RedmineSlack::Client.new('fixture-token')
+    SlackSmokeTransport.body = '{"ok":true,"messages":[{"ts":"123.456","text":"fixture"}]}'
+    assert_equal 'fixture', client.conversation_parent('CFIXTURE', '123.456')['text']
+    request = SlackSmokeTransport.requests.last
+    assert_equal({channel: 'CFIXTURE', latest: '123.456', inclusive: true, limit: 1}, request[:body])
+    assert_nil client.conversation_parent('CFIXTURE', '999.000')
+    SlackSmokeTransport.requests.clear
+    Setting.attachment_max_size = '1'
+    file = {'url_private_download' => 'https://files.slack.com/synthetic-file', 'url_private' => 'https://example.invalid/file', 'size' => 1025}
+    assert_nil client.download_file(file)
+    assert_empty SlackSmokeTransport.requests
+    file['size'] = 1024
+    SlackSmokeTransport.body = "\x00\xff".b
+    bytes = client.download_file(file)
+    assert_equal "\x00\xff".b, bytes
+    assert_equal Encoding::BINARY, bytes.encoding
+    assert_equal 'Bearer fixture-token', SlackSmokeTransport.requests.last[:headers]['Authorization']
+    file.delete('url_private_download')
+    assert_nil client.download_file(file)
+    file['url_private'] = 'https://files.slack.com/synthetic-file'
+    assert_equal bytes, client.download_file(file)
+    file['url_private'] = 'http://files.slack.com/synthetic-file'
+    assert_nil client.download_file(file)
+    assert_raises(RuntimeError) { HTTPClient.new.get('https://files.slack.com/not-allowed') }
+  end
+
+  def test_slack_text_conversion_and_quote_separation
+    resolver = Object.new
+    linked = @user
+    resolver.define_singleton_method(:user) { |id| id == 'ULINKED' ? linked : nil }
+    resolver.define_singleton_method(:display_name) { |_id| 'Slack Person' }
+    text = "#123+= &amp; &lt; &gt; <@ULINKED> <@UOTHER> <https://example.invalid|label> <https://example.invalid> <#C123|general> <!here> <!channel> <!everyone> *unchanged*\n> quoted\nnext\n> another\n\nseparated"
+    converted = RedmineSlack::InboundMessage.new(text).convert(resolver)
+    assert_includes converted, "& < > @#{@user.login} Slack Person [label](https://example.invalid) https://example.invalid #general @here @channel @everyone *unchanged*"
+    assert_includes converted, "> quoted\n\nnext\n> another\n\nseparated"
+    refute_includes converted, '#123+='
+  end
+
+  def test_message_link_allows_a_journalless_tombstone
+    link = RedmineSlack::MessageLink.create!(channel_id: 'CFIXTURE', message_ts: '123.456', deleted_at: Time.current)
+    assert_nil link.reload.journal_id
+    assert_not_nil link.deleted_at
+    assert_raises(ActiveRecord::RecordNotUnique) do
+      RedmineSlack::MessageLink.create!(channel_id: 'CFIXTURE', message_ts: '123.456')
+    end
+  end
+
+  def test_references_and_markers
+    origin = "#{Setting.protocol}://#{Setting.host_name}"
+    message = RedmineSlack::InboundMessage.new("#12 <#{origin}/issues/12?x=1|label> <#{origin}/issues/23#note> #{origin}/issues/45 #23 #12+= #67+=")
+    assert_equal [12, 23, 45, 67], message.references
+    assert_equal 12, message.marker
+    assert_equal [23, 45], message.preview_references
+    assert_includes message.without_marker, '#67+='
+    refute_includes message.without_marker, '#12+='
+    unrelated = RedmineSlack::InboundMessage.new('https://elsewhere.invalid/issues/9#123 http://elsewhere.invalid/issues/11')
+    assert_empty unrelated.references
+    opposite = Setting.protocol == 'https' ? 'http' : 'https'
+    assert_empty RedmineSlack::InboundMessage.new("#{opposite}://#{Setting.host_name}/issues/42").references
+  end
+end
+
+class SlackEventJobSmokeTest < SlackWorkflowSmokeTest
+  setup do
+    @initial_attachment_id = Attachment.maximum(:id).to_i
+    @event_settings = {'import_enabled' => '1', 'delivery_enabled' => '0', 'signing_secret' => 'fixture-secret',
+      'bot_token' => 'fixture-token', 'import_user_id' => @user.id.to_s, 'username' => 'fixture-bot', 'icon' => ':robot_face:'}
+    Setting.plugin_redmine_slack = @event_settings
+    @event = {'type' => 'message', 'channel_type' => 'group', 'channel' => 'CFIXTURE', 'user' => 'UFIXTURE', 'text' => "##{@issue.id}"}
+  end
+
+  def cleanup_import_fixture_files
+    Attachment.where('id > ?', @initial_attachment_id).where(container_type: 'Issue', container_id: @issue.id, author_id: @user.id).find_each do |attachment|
+      next unless attachment.filename.start_with?('slack-import-fixture-')
+      File.delete(attachment.diskfile) if File.file?(attachment.diskfile)
+    end
+  end
+
+  def with_issue_lookup(issue)
+    Issue.define_singleton_method(:find_by) { |**_args| issue }
+    yield
+  ensure
+    Issue.singleton_class.remove_method(:find_by)
+  end
+
+  def test_previews_run_independently_of_outbound_delivery
+    @issue.update!(subject: 'Subject <tag>', description: 'Description & details')
+    RedmineSlack::EventJob.perform_now(@event)
+    payload = JSON.parse(SlackSmokeTransport.requests.last[:body])
+    assert_equal 'CFIXTURE', payload['channel']
+    assert_equal false, payload['unfurl_links']
+    assert_equal false, payload['unfurl_media']
+    assert_equal 'fixture-bot', payload['username']
+    assert_equal ':robot_face:', payload['icon_emoji']
+    refute payload.key?('thread_ts')
+    text = payload['attachments'].first['text']
+    [@issue.tracker.name, @issue.project.name, @issue.status.name, @issue.priority.name, 'Subject &lt;tag&gt;', 'Description &amp; details', "/issues/#{@issue.id}"].each { |value| assert_includes text, value }
+    %w[file_share thread_broadcast].each do |subtype|
+      SlackSmokeTransport.requests.clear
+      RedmineSlack::EventJob.perform_now(@event.merge('subtype' => subtype, 'thread_ts' => '123.456'))
+      preview = SlackSmokeTransport.requests.find { |request| request[:url].end_with?('/chat.postMessage') }
+      assert_equal '123.456', JSON.parse(preview[:body])['thread_ts']
+    end
+  end
+
+  def test_permanent_preview_failure_does_not_prevent_import
+    other = Issue.where.not(id: @issue.id).first!
+    @user.rslack_preference[:username] = 'ULINKED01'
+    SlackSmokeTransport.body = '{"ok":false,"error":"msg_too_long"}'
+    event = @event.merge('ts' => '190.001', 'user' => 'ULINKED01', 'text' => "##{@issue.id}+= imported ##{other.id}")
+    RedmineSlack::EventJob.perform_now(event)
+    link = RedmineSlack::MessageLink.find_by!(channel_id: event['channel'], message_ts: event['ts'])
+    assert_equal "imported ##{other.id}", Journal.find(link.journal_id).notes
+    assert_equal 1, SlackSmokeTransport.requests.count { |request| request[:url].end_with?('/chat.postMessage') }
+  end
+
+  def test_combined_preview_excludes_markers_missing_and_invisible_issues
+    other = Issue.where.not(id: @issue.id).first!
+    RedmineSlack::EventJob.perform_now(@event.merge('channel_type' => 'im', 'text' => "##{@issue.id} ##{other.id} ##{@issue.id} #999999999"))
+    payload = JSON.parse(SlackSmokeTransport.requests.last[:body])
+    assert_equal 2, payload['attachments'].size
+    assert_includes payload['attachments'][0]['text'], "/issues/#{@issue.id}"
+    assert_includes payload['attachments'][1]['text'], "/issues/#{other.id}"
+    SlackSmokeTransport.requests.clear
+    @user.rslack_preference[:username] = 'ULINKED01'
+    RedmineSlack::EventJob.perform_now(@event.merge('ts' => '123.456', 'user' => 'ULINKED01', 'text' => "##{@issue.id}+= ##{other.id}"))
+    payload = JSON.parse(SlackSmokeTransport.requests.find { |r| r[:url].end_with?('/chat.postMessage') }[:body])
+    assert_equal 1, payload['attachments'].size
+    assert_includes payload['attachments'][0]['text'], "/issues/#{other.id}"
+    outsider = User.create!(login: 'slack_preview_outsider', firstname: 'Slack', lastname: 'Outsider', mail: 'slack-preview@example.invalid', password: 'FixturePassword_104!', password_confirmation: 'FixturePassword_104!')
+    @issue.project.update_column(:is_public, false)
+    refute @issue.reload.visible?(outsider)
+    Setting.plugin_redmine_slack = @event_settings.merge('import_user_id' => outsider.id.to_s)
+    SlackSmokeTransport.requests.clear
+    RedmineSlack::EventJob.perform_now(@event)
+    assert_empty SlackSmokeTransport.requests
+  end
+
+  def test_ineligible_events_and_configuration_do_no_work
+    [@event.merge('bot_id' => 'B1'), @event.merge('subtype' => 'bot_message'),
+      @event.merge('subtype' => 'message_changed'), @event.merge('subtype' => 'message_deleted'),
+      @event.merge('subtype' => 'unsupported'), @event.merge('channel_type' => 'channel'),
+      @event.merge('channel_type' => 'mpim'), @event.merge('text' => '#999999999')].each do |event|
+      RedmineSlack::EventJob.perform_now(event)
+    end
+    %w[import_enabled signing_secret bot_token import_user_id].each do |key|
+      Setting.plugin_redmine_slack = @event_settings.merge(key => '')
+      RedmineSlack::EventJob.perform_now(@event)
+    end
+    assert_empty SlackSmokeTransport.requests
+    assert_equal 'slack', RedmineSlack::EventJob.queue_name
+    refute RedmineSlack::EventJob.log_arguments
+  end
+
+  def test_marker_import_uses_linked_author_and_deduplicates
+    @user.rslack_preference[:username] = 'ULINKED01'
+    event = @event.merge('text' => "##{@issue.id}+= imported fixture", 'ts' => '123.456', 'user' => 'ULINKED01')
+    assert_difference 'Journal.count', 1 do
+      RedmineSlack::EventJob.perform_now(event)
+      RedmineSlack::EventJob.perform_now(event)
+    end
+    link = RedmineSlack::MessageLink.find_by!(channel_id: 'CFIXTURE', message_ts: '123.456')
+    journal = Journal.find(link.journal_id)
+    assert_equal @user.id, journal.user_id
+    assert_equal 'imported fixture', journal.notes
+    refute_includes journal.notes, '[silent-update]'
+    changed = @event.merge('subtype' => 'message_changed', 'message' => {'ts' => '123.456', 'text' => "##{@issue.id}+= edited\n\nnext", 'edited' => {'ts' => '123.457'}})
+    RedmineSlack::EventJob.perform_now(changed)
+    assert_equal "edited\n\nnext", journal.reload.notes
+    assert_equal '123.457', link.reload.last_edited_ts
+    changed['message']['text'] = 'stale'
+    RedmineSlack::EventJob.perform_now(changed)
+    assert_equal "edited\n\nnext", journal.reload.notes
+    deletion = @event.merge('subtype' => 'message_deleted', 'deleted_ts' => '123.456', 'event_ts' => '123.458')
+    RedmineSlack::EventJob.perform_now(deletion)
+    assert_match(/\A_Deleted in Slack on .*_\n\n~~edited~~\n\n~~next~~\z/, journal.reload.notes)
+    deleted_notes = journal.notes
+    RedmineSlack::EventJob.perform_now(deletion)
+    changed['message']['edited']['ts'] = '123.459'
+    RedmineSlack::EventJob.perform_now(changed)
+    assert_equal deleted_notes, journal.reload.notes
+  end
+
+  def test_thread_parent_routing_uses_text_then_attachments_and_marker_precedes_lookup
+    @user.rslack_preference[:username] = 'ULINKED01'
+    parent = {ok: true, messages: [{ts: 'parent.1', text: "##{@issue.id}", bot_id: 'B1', attachments: [{title: '#999999999'}]}]}
+    SlackSmokeTransport.body = parent.to_json
+    event = @event.merge('subtype' => 'thread_broadcast', 'text' => 'reply', 'thread_ts' => 'parent.1', 'ts' => 'reply.1', 'user' => 'ULINKED01')
+    RedmineSlack::EventJob.perform_now(event)
+    assert_equal 'reply', Journal.find(RedmineSlack::MessageLink.find_by!(message_ts: 'reply.1').journal_id).notes
+    parent[:messages][0][:text] = ''
+    parent[:messages][0][:attachments] = [{title: "##{@issue.id}", text: '#999999999'}]
+    SlackSmokeTransport.body = parent.to_json
+    RedmineSlack::EventJob.perform_now(event.merge('ts' => 'reply.2'))
+    assert RedmineSlack::MessageLink.exists?(message_ts: 'reply.2')
+    SlackSmokeTransport.requests.clear
+    RedmineSlack::EventJob.perform_now(event.merge('ts' => 'reply.3', 'text' => "##{@issue.id}+= explicit"))
+    assert RedmineSlack::MessageLink.exists?(message_ts: 'reply.3')
+    refute SlackSmokeTransport.requests.any? { |request| request[:url].end_with?('/conversations.history') }
+    parent[:messages][0][:text] = 'no issue'
+    parent[:messages][0][:attachments] = []
+    SlackSmokeTransport.body = parent.to_json
+    RedmineSlack::EventJob.perform_now(event.merge('ts' => 'reply.4'))
+    refute RedmineSlack::MessageLink.exists?(message_ts: 'reply.4')
+  end
+
+  def test_deletion_before_import_suppresses_late_message
+    @user.rslack_preference[:username] = 'ULINKED01'
+    deletion = @event.merge('subtype' => 'message_deleted', 'deleted_ts' => 'late.1', 'event_ts' => '123.458')
+    RedmineSlack::EventJob.perform_now(deletion)
+    link = RedmineSlack::MessageLink.find_by!(message_ts: 'late.1')
+    assert_nil link.journal_id
+    assert_not_nil link.deleted_at
+    assert_no_difference 'Journal.count' do
+      RedmineSlack::EventJob.perform_now(@event.merge('ts' => 'late.1', 'user' => 'ULINKED01', 'text' => "##{@issue.id}+= late"))
+    end
+  end
+
+  def test_edit_watermarks_missing_journals_and_unchanged_attribution
+    @user.define_singleton_method(:member_of?) { |_project| true }
+    importer = RedmineSlack::CommentImporter.new(RedmineSlack::Client.new('fixture-token'), @user)
+    SlackSmokeTransport.body = '{"ok":true,"user":{"profile":{"display_name":"Outside Person"}}}'
+    event = @event.merge('ts' => '180.000000000000000001', 'user' => 'UOUTSIDE', 'text' => "##{@issue.id}+= original")
+    importer.create(event, @issue.id)
+    link = RedmineSlack::MessageLink.find_by!(message_ts: event['ts'])
+    journal = Journal.find(link.journal_id)
+    original_issue_id, original_user_id = journal.journalized_id, journal.user_id
+    change = @event.merge('subtype' => 'message_changed', 'message' => {'ts' => event['ts'], 'text' => '#999999999+= changed', 'edited' => {'ts' => '180.000000000000000002'}})
+    SlackSmokeTransport.requests.clear
+    RedmineSlack::EventJob.perform_now(change)
+    assert_equal "**Outside Person** (Slack):\nchanged", journal.reload.notes
+    assert_equal [original_issue_id, original_user_id], [journal.journalized_id, journal.user_id]
+    assert_equal '180.000000000000000002', link.reload.last_edited_ts
+    assert_empty SlackSmokeTransport.requests
+    %w[180.000000000000000001 180.000000000000000002].each do |ts|
+      change['message']['edited']['ts'] = ts
+      change['message']['text'] = 'stale'
+      RedmineSlack::EventJob.perform_now(change)
+    end
+    assert_equal "**Outside Person** (Slack):\nchanged", journal.reload.notes
+    change['message']['ts'] = 'missing'
+    change['message']['edited']['ts'] = '181.0'
+    assert_no_difference ['Journal.count', 'RedmineSlack::MessageLink.count'] do
+      RedmineSlack::EventJob.perform_now(change)
+    end
+    change['message']['ts'] = event['ts']
+    Journal.where(id: journal.id).delete_all
+    RedmineSlack::EventJob.perform_now(change)
+    assert_equal '180.000000000000000002', link.reload.last_edited_ts
+    RedmineSlack::EventJob.perform_now(@event.merge('subtype' => 'message_deleted', 'deleted_ts' => event['ts'], 'event_ts' => '182.0'))
+    assert_not_nil link.reload.deleted_at
+    assert_nil Journal.find_by(id: journal.id)
+  end
+
+  def test_fallback_requires_membership_and_attributes_slack_author
+    importer = RedmineSlack::CommentImporter.new(RedmineSlack::Client.new('fixture-token'), @user)
+    SlackSmokeTransport.body = '{"ok":true,"user":{"profile":{"display_name":"Outside Person"}}}'
+    event = @event.merge('ts' => 'fallback.1', 'user' => 'UUNLINKED', 'text' => "##{@issue.id}+= fixture")
+    @user.define_singleton_method(:member_of?) { |_project| false }
+    assert_no_difference 'Journal.count' do
+      importer.create(event, @issue.id)
+    end
+    refute RedmineSlack::MessageLink.exists?(message_ts: 'fallback.1')
+    @user.define_singleton_method(:member_of?) { |_project| true }
+    importer.create(event, @issue.id)
+    link = RedmineSlack::MessageLink.find_by!(message_ts: 'fallback.1')
+    assert_equal "**Outside Person** (Slack):\nfixture", Journal.find(link.journal_id).notes
+    assert_equal 'Outside Person', link.author_name
+  end
+
+  def test_denied_linked_author_falls_back_and_denied_import_user_skips
+    linked = User.active.where.not(id: @user.id).first!
+    linked.rslack_preference[:username] = 'UDENIED'
+    @user.define_singleton_method(:member_of?) { |_project| true }
+    linked_id = linked.id
+    @issue.define_singleton_method(:visible?) { |user| user.id != linked_id }
+    importer = RedmineSlack::CommentImporter.new(RedmineSlack::Client.new('fixture-token'), @user)
+    SlackSmokeTransport.body = '{"ok":true,"user":{"profile":{"display_name":"Denied Author"}}}'
+    event = @event.merge('ts' => '160.001', 'user' => 'UDENIED', 'text' => "##{@issue.id}+= body")
+    with_issue_lookup(@issue) { importer.create(event, @issue.id) }
+    journal = Journal.find(RedmineSlack::MessageLink.find_by!(message_ts: '160.001').journal_id)
+    assert_equal @user.id, journal.user_id
+    assert_equal "**Denied Author** (Slack):\nbody", journal.notes
+    [[:visible?, false], [:notes_addable?, false]].each_with_index do |(method, _), index|
+      @issue.define_singleton_method(:visible?) { |_user| false } if method == :visible?
+      if method == :notes_addable?
+        @issue.define_singleton_method(:visible?) { |user| user.id != linked_id }
+        @issue.define_singleton_method(:notes_addable?) { |_user| false }
+      end
+      SlackSmokeTransport.requests.clear
+      assert_no_difference 'Journal.count' do
+        with_issue_lookup(@issue) { importer.create(event.merge('ts' => "160.00#{index + 2}"), @issue.id) }
+      end
+      assert_empty SlackSmokeTransport.requests
+    end
+  end
+
+  def test_failed_save_and_unique_collision_leave_no_duplicate_import
+    @user.rslack_preference[:username] = 'ULINKED01'
+    event = @event.merge('ts' => '170.001', 'user' => 'ULINKED01', 'text' => "##{@issue.id}+= body")
+    importer = RedmineSlack::CommentImporter.new(RedmineSlack::Client.new('fixture-token'), @user)
+    @issue.define_singleton_method(:save!) { raise ActiveRecord::RecordInvalid.new(self) }
+    assert_no_difference ['Journal.count', 'RedmineSlack::MessageLink.count'] do
+      assert_raises(ActiveRecord::RecordInvalid) { with_issue_lookup(@issue) { importer.create(event, @issue.id) } }
+    end
+    refute RedmineSlack::MessageLink.exists?(message_ts: '170.001')
+    RedmineSlack::MessageLink.create!(channel_id: event['channel'], message_ts: event['ts'])
+    RedmineSlack::MessageLink.define_singleton_method(:exists?) { |*_args| false }
+    assert_no_difference 'Journal.count' do
+      importer.create(event, @issue.id)
+    end
+  ensure
+    RedmineSlack::MessageLink.singleton_class.remove_method(:exists?) if RedmineSlack::MessageLink.singleton_class.instance_methods(false).include?(:exists?)
+  end
+
+  def test_file_imports_validate_and_keep_note_and_journal_details
+    ActiveJob::Base.queue_adapter = :test
+    @user.rslack_preference[:username] = 'ULINKED01'
+    Setting.attachment_max_size = '1'
+    Setting.attachment_extensions_denied = 'exe'
+    files = %w[slack-import-fixture-image.png slack-import-fixture-text.txt slack-import-fixture-oversized.txt slack-import-fixture-blocked.exe slack-import-fixture-failed.txt].map do |name|
+      {'name' => name, 'size' => 1, 'url_private_download' => 'https://files.slack.com/synthetic-file'}
+    end
+    SlackSmokeTransport.responses = [[200, "\x00\xff".b, {}], [200, 'text bytes'.b, {}],
+      [200, 'x'.b * 1025, {}], [200, 'blocked'.b, {}], [503, '', {}]]
+    event = @event.merge('ts' => '150.001', 'user' => 'ULINKED01', 'text' => "##{@issue.id}+= note", 'files' => files)
+    previous_user = User.current
+    RedmineSlack::EventJob.perform_now(event)
+    assert_equal previous_user, User.current
+    journal = Journal.find(RedmineSlack::MessageLink.find_by!(message_ts: '150.001').journal_id)
+    assert_equal 'note', journal.notes
+    assert journal.notify?
+    refute_includes journal.notes, '[silent-update]'
+    details = journal.details.where(property: 'attachment').order(:id).to_a
+    assert_equal %w[slack-import-fixture-image.png slack-import-fixture-text.txt], details.map(&:value)
+    attachments = details.map { |detail| Attachment.find(detail.prop_key) }
+    assert_equal ["\x00\xff".b, 'text bytes'.b], attachments.map { |attachment| File.binread(attachment.diskfile) }
+    assert_empty ActiveJob::Base.queue_adapter.enqueued_jobs.select { |job| job[:job] == RedmineSlack::DeliveryJob }
+    changed = @event.merge('subtype' => 'message_changed', 'message' => {'ts' => '150.001', 'text' => 'edited', 'edited' => {'ts' => '150.002'}, 'files' => []})
+    SlackSmokeTransport.requests.clear
+    RedmineSlack::EventJob.perform_now(changed)
+    assert_empty SlackSmokeTransport.requests
+    assert_equal 2, journal.reload.details.where(property: 'attachment').count
+    RedmineSlack::EventJob.perform_now(@event.merge('subtype' => 'message_deleted', 'deleted_ts' => '150.001', 'event_ts' => '150.003'))
+    assert_equal 2, journal.reload.details.where(property: 'attachment').count
+    assert attachments.all? { |attachment| File.exist?(attachment.diskfile) }
+  ensure
+    cleanup_import_fixture_files
+  end
+
+  def test_file_only_linked_and_fallback_comments
+    ActiveJob::Base.queue_adapter = :test
+    @user.rslack_preference[:username] = 'ULINKED01'
+    file = {'name' => 'slack-import-fixture-only.txt', 'size' => 2, 'url_private_download' => 'https://files.slack.com/synthetic-file'}
+    SlackSmokeTransport.body = 'ok'.b
+    event = @event.merge('ts' => '151.001', 'user' => 'ULINKED01', 'text' => "##{@issue.id}+=", 'files' => [file])
+    RedmineSlack::EventJob.perform_now(event)
+    journal = Journal.find(RedmineSlack::MessageLink.find_by!(message_ts: '151.001').journal_id)
+    assert_equal '', journal.notes.to_s
+    assert_equal 1, journal.details.where(property: 'attachment').count
+    assert journal.notify?
+    @user.define_singleton_method(:member_of?) { |_project| true }
+    importer = RedmineSlack::CommentImporter.new(RedmineSlack::Client.new('fixture-token'), @user)
+    info = '{"ok":true,"user":{"profile":{"display_name":"Outside Person"}}}'
+    SlackSmokeTransport.responses = [[200, info, {}], [200, info, {}], [200, 'ok'.b, {}]]
+    importer.create(event.merge('ts' => '151.002', 'user' => 'UOUTSIDE'), @issue.id)
+    fallback = Journal.find(RedmineSlack::MessageLink.find_by!(message_ts: '151.002').journal_id)
+    assert_equal '**Outside Person** (Slack):', fallback.notes
+    assert_equal 1, fallback.details.where(property: 'attachment').count
+    assert fallback.notify?
+    refute_includes fallback.notes, '[silent-update]'
+    assert_empty ActiveJob::Base.queue_adapter.enqueued_jobs.select { |job| job[:job] == RedmineSlack::DeliveryJob }
+  ensure
+    cleanup_import_fixture_files
   end
 end
 
@@ -855,8 +1273,131 @@ class SlackUserAdminSmokeTest < SlackWorkflowSmokeTest
   end
 end
 
+class SlackEventsSmokeTest < ActionDispatch::IntegrationTest
+  setup do
+    raise 'Run only against the upgraded local db service' unless ActiveRecord::Base.connection_db_config.host == 'db'
+    raise 'Local Slack delivery must start disabled in plugin settings' if Setting.plugin_redmine_slack.with_indifferent_access[:delivery_enabled] == '1'
+    @connection = ActiveRecord::Base.connection
+    @connection.begin_transaction(joinable: false)
+    @previous_adapter = ActiveJob::Base.queue_adapter
+    ActiveJob::Base.queue_adapter = :test
+    SlackSmokeTransport.requests.clear
+    Setting.plugin_redmine_slack = {'signing_secret' => 'fixture-secret', 'import_enabled' => '0'}
+  end
+
+  teardown do
+    @connection.rollback_transaction if @connection
+    ActiveJob::Base.queue_adapter = @previous_adapter if @previous_adapter
+    Setting.clear_cache
+  end
+
+  def signed_post(body, timestamp: Time.now.to_i.to_s, secret: 'fixture-secret', signature: nil)
+    signature ||= "v0=#{OpenSSL::HMAC.hexdigest('SHA256', secret, "v0:#{timestamp}:#{body}")}"
+    post '/redmine_slack/events', params: body, headers: {'CONTENT_TYPE' => 'application/json',
+      'X-Slack-Request-Timestamp' => timestamp, 'X-Slack-Signature' => signature}
+  end
+
+  def test_signed_challenge_and_callbacks_without_login_or_csrf
+    signed_post('{ "type": "url_verification", "challenge": "fixture-challenge" }')
+    assert_response :success
+    assert_equal 'fixture-challenge', response.body
+    assert_empty enqueued_jobs
+    body = '{ "type": "event_callback", "event": {"type":"message"} }'
+    issue_reads = []
+    subscriber = ->(*args) { issue_reads << args.last[:sql] if args.last[:sql].match?(/\bFROM\s+[`"]?issues\b/i) }
+    ActiveSupport::Notifications.subscribed(subscriber, 'sql.active_record') do
+      2.times do
+        signed_post(body)
+        assert_response :success
+      end
+    end
+    assert_empty issue_reads
+    assert_equal 2, enqueued_jobs.size
+    assert_empty SlackSmokeTransport.requests
+  end
+
+  def test_signed_callback_through_import_edit_and_delete
+    user = User.active.where(admin: true).first!
+    issue = Issue.joins(:custom_values).where(custom_values: {custom_field_id: 8}).where.not(custom_values: {value: [nil, '']}).first!
+    user.rslack_preference[:username] = 'UE2ETEST'
+    Setting.plugin_redmine_slack = {'signing_secret' => 'fixture-secret', 'import_enabled' => '1', 'delivery_enabled' => '0', 'bot_token' => 'fixture-token', 'import_user_id' => user.id.to_s}
+    base = {'type' => 'message', 'channel_type' => 'group', 'channel' => 'CE2E', 'user' => 'UE2ETEST'}
+    events = [base.merge('ts' => '200.001', 'text' => "##{issue.id}+= original"),
+      base.merge('subtype' => 'message_changed', 'message' => {'ts' => '200.001', 'text' => 'edited', 'edited' => {'ts' => '200.002'}}),
+      base.merge('subtype' => 'message_deleted', 'deleted_ts' => '200.001', 'event_ts' => '200.003')]
+    events.each_with_index do |event, index|
+      signed_post({type: 'event_callback', event: event}.to_json)
+      assert_response :success
+      queued = enqueued_jobs.find { |job| job[:job] == RedmineSlack::EventJob }
+      assert_not_nil queued
+      enqueued_jobs.delete(queued)
+      queued[:job].perform_now(*queued[:args])
+      journal = Journal.find(RedmineSlack::MessageLink.find_by!(channel_id: 'CE2E', message_ts: '200.001').journal_id)
+      case index
+      when 0 then assert_equal 'original', journal.notes
+      when 1 then assert_equal 'edited', journal.notes
+      when 2 then assert_match(/\A_Deleted in Slack on .*_\n\n~~edited~~\z/, journal.notes)
+      end
+    end
+    assert_empty SlackSmokeTransport.requests
+  end
+
+  def test_rejects_invalid_missing_and_replayed_signatures
+    body = '{"type":"event_callback","event":{}}'
+    signed_post(body, signature: 'v0=invalid')
+    assert_response :forbidden
+    [-301, 301].each do |offset|
+      signed_post(body, timestamp: (Time.now.to_i + offset).to_s)
+      assert_response :forbidden
+    end
+    post '/redmine_slack/events', params: body, headers: {'CONTENT_TYPE' => 'application/json'}
+    assert_response :forbidden
+    post '/redmine_slack/events', params: body, headers: {'CONTENT_TYPE' => 'application/json', 'X-Slack-Request-Timestamp' => Time.now.to_i.to_s}
+    assert_response :forbidden
+    post '/redmine_slack/events', params: body, headers: {'CONTENT_TYPE' => 'application/json', 'X-Slack-Signature' => 'v0=invalid'}
+    assert_response :forbidden
+    Setting.plugin_redmine_slack = {'signing_secret' => ''}
+    signed_post(body)
+    assert_response :forbidden
+    assert_empty enqueued_jobs
+  end
+end
+
 class SlackSettingsSmokeTest < SlackWorkflowSmokeTest
   tests SettingsController
+
+  def test_inbound_settings_preserve_and_filter_signing_secret
+    assert_equal '0', Redmine::Plugin.find(:redmine_slack).settings[:default]['import_enabled']
+    inactive = User.where(status: User::STATUS_LOCKED).first
+    get :plugin, params: {id: 'redmine_slack'}
+    assert_select '#settings_import_enabled:not([checked])'
+    assert_select '#settings_import_user_id option[value=?]', @user.id.to_s
+    assert_select '#settings_import_user_id option[value=?]', inactive.id.to_s, count: 0 if inactive
+    assert_select '#slack-signing-secret-status', text: 'Not configured'
+    assert_select 'input[type=password][name="settings[signing_secret]"][value=""]'
+    csrf_token = css_select('meta[name="csrf-token"]').first['content']
+    post :plugin, params: {id: 'redmine_slack', authenticity_token: csrf_token,
+      settings: {signing_secret: 'fixture-signing-secret', bot_token: 'fixture-token', import_enabled: '1', import_user_id: @user.id, delivery_enabled: '0', post_updates: '1'}}
+    assert_equal '[FILTERED]', @request.filtered_parameters['settings']['signing_secret']
+    assert_equal 'fixture-signing-secret', Setting.plugin_redmine_slack['signing_secret']
+    assert_equal @user.id.to_s, Setting.plugin_redmine_slack['import_user_id'].to_s
+    assert_equal '1', Setting.plugin_redmine_slack['import_enabled']
+    get :plugin, params: {id: 'redmine_slack'}
+    assert_select '#slack-signing-secret-status', text: 'Configured'
+    assert_select 'input[type=password][name="settings[signing_secret]"][value=""]'
+    refute_includes response.body, 'fixture-signing-secret'
+    ['', nil].each do |value|
+      submitted = {delivery_enabled: '0', post_updates: '1'}
+      submitted[:signing_secret] = value unless value.nil?
+      post :plugin, params: {id: 'redmine_slack', authenticity_token: csrf_token, settings: submitted}
+      assert_equal 'fixture-signing-secret', Setting.plugin_redmine_slack['signing_secret']
+      assert_equal 'fixture-token', Setting.plugin_redmine_slack['bot_token']
+      assert_equal '1', Setting.plugin_redmine_slack['post_updates']
+      assert_equal '0', Setting.plugin_redmine_slack['delivery_enabled']
+    end
+    post :plugin, params: {id: 'redmine_slack', authenticity_token: csrf_token, settings: {signing_secret: 'replacement-secret'}}
+    assert_equal 'replacement-secret', Setting.plugin_redmine_slack['signing_secret']
+  end
 
   def test_token_is_preserved_replaced_filtered_and_never_rendered
     get :plugin, params: {id: 'redmine_slack'}

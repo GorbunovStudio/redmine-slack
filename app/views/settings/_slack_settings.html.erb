@@ -5,6 +5,23 @@
 </p>
 
 <p>
+	<label for="settings_import_enabled">Enable Slack import</label>
+	<%= hidden_field_tag 'settings[import_enabled]', '0' %>
+	<%= check_box_tag 'settings[import_enabled]', '1', settings['import_enabled'] == '1', id: 'settings_import_enabled' %>
+</p>
+
+<p>
+	<label for="settings_signing_secret">Slack signing secret</label>
+	<%= password_field_tag 'settings[signing_secret]', '', autocomplete: 'new-password', aria: {describedby: 'slack-signing-secret-status'} %>
+	<span id="slack-signing-secret-status"><%= settings['signing_secret'].present? ? 'Configured' : 'Not configured' %></span>
+</p>
+
+<p>
+	<label for="settings_import_user_id">Slack import user</label>
+	<%= select_tag 'settings[import_user_id]', options_from_collection_for_select(User.active.sorted, :id, :name, settings['import_user_id'].to_s), include_blank: true %>
+</p>
+
+<p>
 	<label for="settings_bot_token">Slack bot token</label>
 	<%= password_field_tag 'settings[bot_token]', '', autocomplete: 'new-password', aria: {describedby: 'slack-bot-token-status'} %>
 	<span id="slack-bot-token-status"><%= settings['bot_token'].present? ? 'Configured' : 'Not configured' %></span>

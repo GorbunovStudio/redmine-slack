@@ -63,10 +63,10 @@ Every event-job execution and retry SHALL read current settings before resolutio
 - **AND** ordinary Redmine notification delivery remains disabled
 
 ### Requirement: Restrict eligible conversations and messages
-The integration SHALL process only private-channel and app-DM message events: new messages with no subtype or `file_share`, `message_changed`, and `message_deleted`. It MUST ignore bot-originated messages (`bot_id` or `bot_message`), including nested message data for change/delete events, and every other subtype; public channels, group DMs, and person-to-person DMs are excluded.
+The integration SHALL process only private-channel and app-DM message events: new messages with no subtype, `file_share`, or `thread_broadcast`, `message_changed`, and `message_deleted`. It MUST ignore bot-originated messages (`bot_id` or `bot_message`), including nested message data for change/delete events, and every other subtype; public channels, group DMs, and person-to-person DMs are excluded.
 
 #### Scenario: Human posts text or files
-- **WHEN** a human posts an eligible new message or `file_share` in a private channel containing the bot or in the app's DM
+- **WHEN** a human posts an eligible new message, `file_share`, or `thread_broadcast` in a private channel containing the bot or in the app's DM
 - **THEN** it can produce previews and a routed import, including a message whose only content is files
 
 #### Scenario: Bot, unsupported subtype, or excluded conversation

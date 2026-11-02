@@ -3,6 +3,7 @@ require 'json'
 require 'socket'
 require 'timeout'
 require 'openssl'
+require 'uri'
 
 module RedmineSlack
   class TransientError < StandardError; end
@@ -29,6 +30,27 @@ module RedmineSlack
 
     def lookup_by_email(email)
       request(:get, 'users.lookupByEmail', email: email)
+    end
+
+    def user_info(member_id)
+      request(:get, 'users.info', user: member_id)
+    end
+
+    def conversation_parent(channel, timestamp)
+      result = request(:get, 'conversations.history', channel: channel, latest: timestamp, inclusive: true, limit: 1)
+      Array(result['messages']).find { |message| message['ts'] == timestamp }
+    end
+
+    def download_file(file)
+      return nil if file['size'].to_i > Setting.attachment_max_size.to_i.kilobytes
+      url = file['url_private_download'].presence || file['url_private']
+      uri = URI.parse(url.to_s)
+      return nil unless uri.is_a?(URI::HTTPS) && uri.host == 'files.slack.com' && uri.port == 443 && uri.userinfo.nil?
+      response = @http.get(url, nil, {'Authorization' => "Bearer #{@token}"})
+      check_status!(response)
+      response.body.to_s.b
+    rescue URI::InvalidURIError, HTTPClient::BadResponseError, HTTPClient::TimeoutError, IOError, SystemCallError, SocketError, Timeout::Error, OpenSSL::SSL::SSLError, DropError, TransientError, RateLimitError
+      nil
     end
 
     def open_conversation(member_id)
