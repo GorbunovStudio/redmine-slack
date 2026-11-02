@@ -163,9 +163,9 @@ class SlackListener
         end
 
 
-        msg, channel = prepare_comment_message(issue, journal, channel)
+        msg, channel, image_ids = prepare_comment_message(issue, journal, channel)
         if msg != ""
-            speak msg, channel, []
+            speak msg, channel, [], nil, image_ids
         end
         
         msg, attachment = prepare_priority_change_message(issue, journal)
@@ -225,7 +225,7 @@ class SlackListener
         speak msg, channel, [attachment]
     end
 
-    def speak(msg, channel, attachments=[], icon_emoji=nil)
+    def speak(msg, channel, attachments=[], icon_emoji=nil, image_attachment_ids=[])
         return unless delivery_enabled?
         settings = slack_settings
         return if settings[:bot_token].blank? || channel.blank?
@@ -238,6 +238,7 @@ class SlackListener
         envelope = {'destination' => destination, 'text_parts' => msg.is_a?(Array) ? msg : [msg]}
         envelope['username'] = settings[:username] if settings[:username]
         envelope['attachments'] = attachments if !attachments.blank?
+        envelope['image_attachment_ids'] = image_attachment_ids if image_attachment_ids.present?
         icon = settings[:icon]
         if icon.present?
             if icon.start_with? ':'
@@ -533,6 +534,25 @@ private
         return msg, attachment, ':you_dongler:'
     end
 
+    def comment_inline_images(issue, notes)
+        pattern = case Setting.text_formatting
+        when 'common_mark' then /!\[[^\]]*\]\(([^)]+)\)/
+        when 'textile' then /!([^!\s]+)!/
+        end
+        return [notes.dup, []] unless pattern
+        images = []
+        text = notes.gsub(pattern) do
+            target = Regexp.last_match(1)
+            unless target.match?(/\A[a-z][a-z0-9+.-]*:/i)
+                filename = CGI.unescape(target)
+                attachment = Attachment.latest_attach(issue.attachments, filename)
+                images << attachment if attachment && attachment.image?
+            end
+            ''
+        end
+        [text, images]
+    end
+
     def prepare_comment_message(issue, journal, channel, msg="")
         icon = nil
 
@@ -541,7 +561,9 @@ private
         end
 
 
-        comment, redmine_mentions = RedmineSlack::MessageTemplate.tokenize(journal.notes)
+        notes, inline_images = comment_inline_images(issue, journal.notes)
+        image_ids = (journal.attachments.select(&:image?) + inline_images).map(&:id).uniq
+        comment, redmine_mentions = RedmineSlack::MessageTemplate.tokenize(notes)
 
         redmine_mentions.each do |user|
             if is_client(user, issue.project)
@@ -576,7 +598,7 @@ private
 
         msg = [msg, "\n\n"] + mention + ["#{escape journal.user.to_s} commented:", "\n>>>\n"] + comment
 
-        return msg, channel
+        return msg, channel, image_ids
     end
 
     def prepare_details_change_message(issue, journal, msg="")

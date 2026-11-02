@@ -39,6 +39,24 @@ module RedmineSlack
       request(:post, 'chat.postMessage', payload)
     end
 
+    def upload_url(filename, length)
+      request(:form, 'files.getUploadURLExternal', filename: filename, length: length)
+    end
+
+    def upload_file(url, bytes)
+      response = @http.post(url, bytes, {'Content-Type' => 'application/octet-stream'})
+      check_status!(response)
+      true
+    rescue HTTPClient::BadResponseError
+      raise DropError, 'invalid_response', cause: nil
+    rescue HTTPClient::TimeoutError, IOError, SystemCallError, SocketError, Timeout::Error, OpenSSL::SSL::SSLError
+      raise TransientError, 'transport_error', cause: nil
+    end
+
+    def complete_upload(payload)
+      request(:post, 'files.completeUploadExternal', payload)
+    end
+
     def list_conversations(cursor = nil)
       query = {types: 'private_channel', limit: 100}
       query[:cursor] = cursor if cursor.present?
@@ -52,15 +70,12 @@ module RedmineSlack
       url = "https://slack.com/api/#{name}"
       response = if method == :get
         @http.get(url, data, headers)
+      elsif method == :form
+        @http.post(url, data, headers)
       else
         @http.post(url, JSON.generate(data), headers.merge('Content-Type' => 'application/json'))
       end
-      status = response.status.to_i
-      if status == 429
-        rate_limit!(response)
-      end
-      raise TransientError, "http_#{status}" if (500..599).cover?(status)
-      raise DropError, "http_#{status}" unless (200..299).cover?(status)
+      check_status!(response)
       begin
         payload = JSON.parse(response.body.to_s)
       rescue JSON::ParserError
@@ -78,6 +93,13 @@ module RedmineSlack
       raise DropError, 'invalid_response', cause: nil
     rescue HTTPClient::TimeoutError, IOError, SystemCallError, SocketError, Timeout::Error, OpenSSL::SSL::SSLError
       raise TransientError, 'transport_error', cause: nil
+    end
+
+    def check_status!(response)
+      status = response.status.to_i
+      rate_limit!(response) if status == 429
+      raise TransientError, "http_#{status}" if (500..599).cover?(status)
+      raise DropError, "http_#{status}" unless (200..299).cover?(status)
     end
 
     def rate_limit!(response)

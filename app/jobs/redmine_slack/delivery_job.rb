@@ -39,7 +39,27 @@ module RedmineSlack
       %w[attachments username icon_url icon_emoji].each do |key|
         payload[key] = envelope[key] if envelope.key?(key)
       end
-      client.post_message(payload)
+      files = []
+      Array(envelope['image_attachment_ids']).each do |id|
+        attachment = Attachment.find_by(id: id)
+        next unless attachment && attachment.image?
+        begin
+          bytes = File.binread(attachment.diskfile)
+        rescue IOError, SystemCallError
+          next
+        end
+        upload = client.upload_url(attachment.filename, bytes.bytesize)
+        client.upload_file(upload.fetch('upload_url'), bytes)
+        bytes = nil
+        files << {id: upload.fetch('file_id')}
+      end
+      if files.empty?
+        client.post_message(payload)
+      else
+        completion = {files: files, channel_id: channel, initial_comment: payload['text']}
+        %w[username icon_url icon_emoji].each { |key| completion[key] = payload[key] if payload.key?(key) }
+        client.complete_upload(completion)
+      end
     end
   end
 end
