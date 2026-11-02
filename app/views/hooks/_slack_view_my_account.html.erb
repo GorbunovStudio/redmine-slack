@@ -2,6 +2,7 @@
 <fieldset class="box tabular">
   <legend>Slack</legend>
   <p>
-    <%= label(:redmine_slack, 'Slack username') %>
+    <%= label(:redmine_slack, 'Slack member ID override') %>
     <%= text_field :redmine_slack, :username, :value => @user.rslack_preference[:username] %>
+    <em class="info">Use a Slack member ID (U… or W…) to override lookup; otherwise your Redmine email is used.</em>
   </p>
