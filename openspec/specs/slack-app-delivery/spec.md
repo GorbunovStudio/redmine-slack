@@ -21,13 +21,14 @@ The plugin SHALL replace the Slack URL control with an always-empty bot-token se
 - **AND** an installation without a token displays Not configured with an empty input
 
 ### Requirement: Customized JSON Web API posts
-The plugin SHALL post to `chat.postMessage` using JSON and a Bearer bot token. It MUST preserve composed text, attachments, username, configured icon, and event-specific icon precedence for channel and DM messages, omit `link_names`, and treat JSON boolean `ok: true`, not the HTTP status alone, as success.
+The plugin SHALL post to `chat.postMessage` using JSON and a Bearer bot token. It MUST preserve composed text, attachments, username, configured icon, and event-specific icon precedence for channel and DM messages, omit `link_names`, send `unfurl_links: false` and `unfurl_media: false` so Slack shows no link previews, and treat JSON boolean `ok: true`, not the HTTP status alone, as success.
 
 #### Scenario: Customized post succeeds
 - **WHEN** a delivery job sends a composed channel or DM message and Slack returns a successful response with `ok: true`
 - **THEN** the destination is its conversation ID and attachments are a JSON array, not a webhook form payload
 - **AND** username and icon customization are retained, with the event emoji overriding the configured icon as before
 - **AND** the token occurs only in the Authorization header, never job arguments or URLs
+- **AND** the request sets `unfurl_links` and `unfurl_media` to `false`, so no link preview is shown
 
 #### Scenario: Successful HTTP status contains a Slack rejection
 - **WHEN** Slack returns a successful HTTP status with `ok: false` and `invalid_auth`
