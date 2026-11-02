@@ -85,7 +85,7 @@ The existing manager-triggered reviewer DM SHALL keep its recipient, text, and a
 - **AND** its message is enqueued after the listener's successful issue save without a new transaction wrapper
 
 ### Requirement: Comment images come from journal additions and inline references
-Eligible public comments SHALL include images added in their journal and images referenced inline by attachment filename in the note using the configured formatter's image syntax. Only issue attachments classified as images SHALL qualify. External references with a URL scheme MUST NOT be uploaded or fetched. The resulting selection SHALL be deduplicated by attachment ID.
+Eligible public comments SHALL include images added in their journal and images referenced inline by attachment filename, as the configured formatter parses the note (including image titles and modifiers). Only issue attachments classified as images SHALL qualify. External references with a URL scheme MUST NOT be uploaded or fetched. The resulting selection SHALL be deduplicated by attachment ID.
 
 #### Scenario: Same-journal additions select only images
 - **WHEN** an eligible comment's journal records added image and non-image attachments alongside an attachment removal
@@ -117,6 +117,10 @@ The Slack copy of a comment SHALL omit recognized inline image markup in the con
 - **THEN** the Slack text retains the surrounding text and rendered mention but omits the image markup
 - **AND** the stored note retains its original markup
 - **AND** the existing client-mention support route and automatic mention deduplication remain effective
+
+#### Scenario: Literal image syntax is not an image
+- **WHEN** image syntax appears inside code or is escaped, so the configured formatter renders it as text
+- **THEN** it is neither selected for upload nor removed from the Slack text
 
 ### Requirement: Comment image collection does not bypass comment eligibility
 Private notes, originally blank notes, and comments suppressed by `[silent-update]` SHALL produce no comment job or uploads. An image-only nonblank note SHALL remain eligible after image markup removal. Image handling MUST NOT bypass delivery or post-updates gates or add images to non-comment notifications.

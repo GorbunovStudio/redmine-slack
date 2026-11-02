@@ -535,20 +535,56 @@ private
     end
 
     def comment_inline_images(issue, notes)
-        pattern = case Setting.text_formatting
-        when 'common_mark' then /!\[[^\]]*\]\(([^)]+)\)/
-        when 'textile' then /!([^!\s]+)!/
-        end
-        return [notes.dup, []] unless pattern
         images = []
-        text = notes.gsub(pattern) do
-            target = Regexp.last_match(1)
+        select_image = lambda do |target|
             unless target.match?(/\A[a-z][a-z0-9+.-]*:/i)
                 filename = CGI.unescape(target)
                 attachment = Attachment.latest_attach(issue.attachments, filename)
                 images << attachment if attachment && attachment.image?
             end
-            ''
+        end
+        text = case Setting.text_formatting
+        when 'common_mark'
+            require 'redmine/wiki_formatting/common_mark/formatter'
+            document = Commonmarker.parse(notes, options: {extension: Redmine::WikiFormatting::CommonMark::PIPELINE_CONFIG[:commonmarker_extensions]})
+            offsets = [0]
+            notes.each_line { |line| offsets << offsets.last + line.bytesize }
+            spans = []
+            document.walk do |node|
+                next unless node.type == :image
+                select_image.call(node.url)
+                position = node.source_position
+                start = offsets[position[:start_line] - 1] + position[:start_column] - 1
+                finish = offsets[position[:end_line] - 1] + position[:end_column]
+                spans << [start, finish]
+            end
+            result = notes.dup
+            merged = []
+            spans.sort.each do |start, finish|
+                if merged.any? && start <= merged.last[1]
+                    merged.last[1] = [merged.last[1], finish].max
+                else
+                    merged << [start, finish]
+                end
+            end
+            merged.reverse_each do |start, finish|
+                result = result.byteslice(0, start) + result.byteslice(finish..-1).to_s
+            end
+            result
+        when 'textile'
+            require 'redmine/wiki_formatting/textile/redcloth3'
+            protected_or_image = /((?i:<pre\b[^>]*>.*?<\/pre\s*>|<code\b[^>]*>.*?<\/code\s*>)|@[^@\n]*@)|#{RedCloth3::IMAGE_RE}/m
+            notes.gsub(protected_or_image) do
+                match = Regexp.last_match
+                if match[1]
+                    match[1]
+                else
+                    select_image.call(match[5])
+                    match[2]
+                end
+            end
+        else
+            notes.dup
         end
         [text, images]
     end

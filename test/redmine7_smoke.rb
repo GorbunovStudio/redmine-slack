@@ -455,6 +455,38 @@ class SlackWorkflowBehaviorSmokeTest < SlackWorkflowSmokeTest
     assert_empty SlackSmokeTransport.requests
   end
 
+  def test_commonmark_images_use_parsed_destinations_and_byte_positions
+    image = Struct.new(:id, :filename, :created_on, :image?)
+    screen = image.new(1, 'screen.png', Time.at(1), true)
+    spaced = image.new(2, 'screen shot.png', Time.at(1), true)
+    parens = image.new(3, 'plot(v2).png', Time.at(1), true)
+    issue = Struct.new(:attachments).new([screen, spaced, parens])
+    Setting.text_formatting = 'common_mark'
+    notes = "привет ![s](screen.png \"caption\")\r\n![s](<screen shot.png>) ![s](plot(v2).png) end"
+    text, selected = @listener.send(:comment_inline_images, issue, notes)
+    assert_equal [screen, spaced, parens], selected
+    assert_equal "привет \r\n  end", text
+    assert_equal "привет ![s](screen.png \"caption\")\r\n![s](<screen shot.png>) ![s](plot(v2).png) end", notes
+  end
+
+  def test_commonmark_literal_image_syntax_is_not_selected_or_stripped
+    Setting.text_formatting = 'common_mark'
+    notes = "`![s](screen.png)`\n\n```\n![s](screen.png)\n```\n\n    ![s](screen.png)\n\n\\![s](screen.png)"
+    issue = Struct.new(:attachments).new([])
+    assert_equal [notes, []], @listener.send(:comment_inline_images, issue, notes)
+  end
+
+  def test_textile_images_use_redcloth_modifiers_and_leave_code_untouched
+    image = Struct.new(:id, :filename, :created_on, :image?)
+    screen = image.new(1, 'screen.png', Time.at(1), true)
+    issue = Struct.new(:attachments).new([screen])
+    Setting.text_formatting = 'textile'
+    notes = "before !screen.png(Caption)! and !>screen.png! after\n@!screen.png!@\n<pre>!screen.png!</pre>\n<code>!screen.png!</code>"
+    text, selected = @listener.send(:comment_inline_images, issue, notes)
+    assert_equal [screen, screen], selected
+    assert_equal "before  and  after\n@!screen.png!@\n<pre>!screen.png!</pre>\n<code>!screen.png!</code>", text
+  end
+
   def test_comment_combines_journal_images_and_inline_images_without_mutating_notes
     Setting.text_formatting = 'common_mark'
     image = Struct.new(:id, :filename, :created_on, :image?)
