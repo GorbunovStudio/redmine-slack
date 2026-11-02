@@ -1,6 +1,7 @@
 require 'minitest/autorun'
 require 'action_controller/test_case'
 require 'rake'
+require 'tempfile'
 
 module SlackSmokeTransport
   class << self
@@ -29,9 +30,10 @@ module SlackSmokeTransport
   end
 
   def capture(method, url, body, headers)
-    allowed = {'GET' => %w[users.lookupByEmail conversations.list], 'POST' => %w[conversations.open chat.postMessage]}
+    allowed = {'GET' => %w[users.lookupByEmail conversations.list], 'POST' => %w[conversations.open chat.postMessage files.getUploadURLExternal files.completeUploadExternal]}
     endpoint = url.to_s.split('?').first
-    raise 'Unexpected HTTP request' unless allowed.fetch(method).any? { |name| endpoint == "https://slack.com/api/#{name}" }
+    synthetic_upload = method == 'POST' && url.to_s == 'https://upload.example.invalid/synthetic'
+    raise 'Unexpected HTTP request' unless synthetic_upload || allowed.fetch(method).any? { |name| endpoint == "https://slack.com/api/#{name}" }
     raise SlackSmokeTransport.error if SlackSmokeTransport.error
     SlackSmokeTransport.requests << {method: method, url: url.to_s, body: body, headers: headers}
     response = SlackSmokeTransport.responses&.shift
@@ -58,6 +60,8 @@ class SlackTransportSmokeTest < ActiveSupport::TestCase
     assert_raises(RuntimeError) { client.get('https://example.invalid/unexpected') }
     assert_raises(RuntimeError) { client.post('https://example.invalid/unexpected', '{}') }
     assert_raises(RuntimeError) { client.request('DELETE', 'https://example.invalid/unexpected') }
+    assert_raises(RuntimeError) { client.post('https://upload.example.invalid/other', 'bytes') }
+    assert_raises(RuntimeError) { client.post('https://slack.com/api/files.other', '{}') }
   ensure
     SlackSmokeTransport.requests.clear
     SlackSmokeTransport.status = 200
@@ -96,6 +100,49 @@ class SlackClientSmokeTest < ActiveSupport::TestCase
     refute_includes request[:url], 'xoxb-synthetic-secret'
     SlackSmokeTransport.body = '{"ok":false,"error":"invalid_auth"}'
     assert_equal 'invalid_auth', assert_raises(RedmineSlack::DropError) { @client.post_message(payload) }.message
+  end
+
+  def test_external_upload_requests
+    bytes = "\x00\xFFabc".b
+    SlackSmokeTransport.responses = [[200, '{"ok":true,"upload_url":"https://upload.example.invalid/synthetic","file_id":"F1"}', {}], [200, 'OK', {}], [200, '{"ok":true}', {}]]
+    upload = @client.upload_url('fixture.png', bytes.bytesize)
+    assert @client.upload_file(upload.fetch('upload_url'), bytes)
+    assert @client.complete_upload(files: [{id: upload.fetch('file_id')}, {id: 'F2'}], channel_id: 'C1')['ok']
+    form, raw, complete = SlackSmokeTransport.requests
+    assert_equal({filename: 'fixture.png', length: 5}, form[:body])
+    assert_equal 'Bearer xoxb-synthetic-secret', form[:headers]['Authorization']
+    assert_equal bytes, raw[:body]
+    refute raw[:headers].key?('Authorization')
+    assert_equal 'application/json', complete[:headers]['Content-Type']
+    assert_equal 'Bearer xoxb-synthetic-secret', complete[:headers]['Authorization']
+    assert_equal [{'id' => 'F1'}, {'id' => 'F2'}], JSON.parse(complete[:body])['files']
+  ensure
+    SlackSmokeTransport.responses = nil
+  end
+
+  def test_upload_failure_classification
+    url = 'https://upload.example.invalid/synthetic'
+    SlackSmokeTransport.body = 'not json'
+    assert @client.upload_file(url, 'bytes')
+    SlackSmokeTransport.status = 429
+    SlackSmokeTransport.headers = {'Retry-After' => '7'}
+    assert_equal 7, assert_raises(RedmineSlack::RateLimitError) { @client.upload_file(url, 'bytes') }.wait
+    SlackSmokeTransport.headers = {'Retry-After' => 'invalid'}
+    assert_raises(RedmineSlack::TransientError) { @client.upload_file(url, 'bytes') }
+    SlackSmokeTransport.status = 503
+    assert_raises(RedmineSlack::TransientError) { @client.upload_file(url, 'bytes') }
+    SlackSmokeTransport.status = 403
+    assert_equal 'http_403', assert_raises(RedmineSlack::DropError) { @client.upload_file(url, 'bytes') }.message
+    SlackSmokeTransport.error = IOError.new('secret')
+    error = assert_raises(RedmineSlack::TransientError) { @client.upload_file(url, 'bytes') }
+    assert_equal 'transport_error', error.message
+    assert_nil error.cause
+    SlackSmokeTransport.error = nil
+    SlackSmokeTransport.status = 200
+    SlackSmokeTransport.body = '{"ok":false,"error":"invalid_auth"}'
+    assert_raises(RedmineSlack::DropError) { @client.upload_url('fixture.png', 5) }
+    SlackSmokeTransport.body = '{"ok":false,"error":"internal_error"}'
+    assert_raises(RedmineSlack::TransientError) { @client.complete_upload(files: []) }
   end
 
   def test_response_classification_and_safe_transport_error
@@ -181,13 +228,13 @@ class SlackWorkflowSmokeTest < ActionController::TestCase
     @listener = SlackListener.new
     @messages = []
     messages = @messages
-    @listener.define_singleton_method(:speak) do |message, channel, attachments = [], icon = nil|
+    @listener.define_singleton_method(:speak) do |message, channel, attachments = [], icon = nil, image_ids = []|
       if message.is_a?(Array)
         resolver = Object.new
         resolver.define_singleton_method(:member) { |id| User.find_by(id: id)&.rslack_preference&.[](:username) }
         message = RedmineSlack::MessageTemplate.render(message, resolver)
       end
-      messages << {text: message, channel: channel, attachments: attachments, icon: icon}
+      messages << {text: message, channel: channel, attachments: attachments, icon: icon, image_ids: image_ids}
     end
     @listener.define_singleton_method(:channel_for_project) { |_project| '#fixture-main' }
     @listener.define_singleton_method(:support_channel_for_project) { |_project| '#fixture-support' }
@@ -386,6 +433,99 @@ end
 
 class SlackWorkflowBehaviorSmokeTest < SlackWorkflowSmokeTest
   tests IssuesController
+
+  def test_inline_image_selection_follows_formatter_and_redmine_filename_order
+    image = Struct.new(:id, :filename, :created_on, :image?)
+    old = image.new(1, 'Screen Shot.png', Time.at(1), true)
+    latest = image.new(2, 'SCREEN SHOT.PNG', Time.at(2), true)
+    other = image.new(3, 'document.pdf', Time.at(3), false)
+    issue = Struct.new(:attachments).new([old, latest, other])
+    notes = 'before ![alt](screen%20shot.png) ![x](https://example.invalid/a.png) ![x](missing.png) ![x](document.pdf) !textile.png! after'
+    Setting.text_formatting = 'common_mark'
+    text, selected = @listener.send(:comment_inline_images, issue, notes)
+    assert_equal [latest], selected
+    assert_equal 'before     !textile.png! after', text
+    assert_includes notes, '![alt]'
+    Setting.text_formatting = 'textile'
+    text, selected = @listener.send(:comment_inline_images, issue, '![alt](screen%20shot.png) !screen%20shot.png! !https://example.invalid/a.png!')
+    assert_equal [latest], selected
+    assert_equal '![alt](screen%20shot.png)  ', text
+    Setting.text_formatting = 'none'
+    assert_equal [notes, []], @listener.send(:comment_inline_images, issue, notes)
+    assert_empty SlackSmokeTransport.requests
+  end
+
+  def test_commonmark_images_use_parsed_destinations_and_byte_positions
+    image = Struct.new(:id, :filename, :created_on, :image?)
+    screen = image.new(1, 'screen.png', Time.at(1), true)
+    spaced = image.new(2, 'screen shot.png', Time.at(1), true)
+    parens = image.new(3, 'plot(v2).png', Time.at(1), true)
+    issue = Struct.new(:attachments).new([screen, spaced, parens])
+    Setting.text_formatting = 'common_mark'
+    notes = "привет ![s](screen.png \"caption\")\r\n![s](<screen shot.png>) ![s](plot(v2).png) end"
+    text, selected = @listener.send(:comment_inline_images, issue, notes)
+    assert_equal [screen, spaced, parens], selected
+    assert_equal "привет \r\n  end", text
+    assert_equal "привет ![s](screen.png \"caption\")\r\n![s](<screen shot.png>) ![s](plot(v2).png) end", notes
+  end
+
+  def test_commonmark_literal_image_syntax_is_not_selected_or_stripped
+    Setting.text_formatting = 'common_mark'
+    notes = "`![s](screen.png)`\n\n```\n![s](screen.png)\n```\n\n    ![s](screen.png)\n\n\\![s](screen.png)"
+    issue = Struct.new(:attachments).new([])
+    assert_equal [notes, []], @listener.send(:comment_inline_images, issue, notes)
+  end
+
+  def test_textile_images_use_redcloth_modifiers_and_leave_code_untouched
+    image = Struct.new(:id, :filename, :created_on, :image?)
+    screen = image.new(1, 'screen.png', Time.at(1), true)
+    issue = Struct.new(:attachments).new([screen])
+    Setting.text_formatting = 'textile'
+    notes = "before !screen.png(Caption)! and !>screen.png! after\n@!screen.png!@\n<pre>!screen.png!</pre>\n<code>!screen.png!</code>"
+    text, selected = @listener.send(:comment_inline_images, issue, notes)
+    assert_equal [screen, screen], selected
+    assert_equal "before  and  after\n@!screen.png!@\n<pre>!screen.png!</pre>\n<code>!screen.png!</code>", text
+  end
+
+  def test_comment_combines_journal_images_and_inline_images_without_mutating_notes
+    Setting.text_formatting = 'common_mark'
+    image = Struct.new(:id, :filename, :created_on, :image?)
+    added = image.new(1, 'added.png', Time.at(1), true)
+    reused = image.new(2, 'reused.png', Time.at(1), true)
+    unrelated = image.new(3, 'unrelated.png', Time.at(1), true)
+    nonimage = image.new(4, 'document.pdf', Time.at(1), false)
+    @issue.define_singleton_method(:attachments) { [added, reused, unrelated, nonimage] }
+    notes = "Before ![a](added.png) ![b](added.png) ![c](reused.png) ![d](document.pdf) ![e](missing.png) ![f](https://example.invalid/a.png) @#{@executor.login} after"
+    journal = @issue.init_journal(@user, notes)
+    journal.define_singleton_method(:attachments) { [added, nonimage] }
+    parts, _channel, ids = @listener.send(:prepare_comment_message, @issue, journal, '#fixture-main')
+    assert_equal [1, 2], ids
+    assert_equal notes, journal.notes
+    assert_includes parts.grep(String).join, 'Before'
+    assert_includes parts.grep(String).join, 'after'
+    refute_includes parts.grep(String).join, '!['
+    assert_includes parts, RedmineSlack::MessageTemplate.mention(@executor)
+    assert_empty SlackSmokeTransport.requests
+    journal.notes = '![a](added.png)'
+    parts, _, ids = @listener.send(:prepare_comment_message, @issue, journal, '#fixture-main')
+    assert_includes parts.grep(String).join, 'commented:'
+    assert_equal [1], ids
+  end
+
+  def test_journal_attachment_additions_exclude_removals
+    now = Time.current
+    attachments = %w[added.png removed.png document.pdf].map do |name|
+      Attachment.create!(container: @issue, author: @user, filename: name, disk_filename: "fixture-#{name}", filesize: 1,
+        content_type: name.end_with?('.png') ? 'image/png' : 'application/pdf', digest: 'fixture', created_on: now)
+    end
+    journal = @issue.init_journal(@user, 'Fixture')
+    journal.details.build(property: 'attachment', prop_key: attachments[0].id.to_s, value: 'added.png')
+    journal.details.build(property: 'attachment', prop_key: attachments[1].id.to_s, old_value: 'removed.png', value: nil)
+    journal.details.build(property: 'attachment', prop_key: attachments[2].id.to_s, value: 'document.pdf')
+    _, _, ids = @listener.send(:prepare_comment_message, @issue, journal, '#fixture-main')
+    assert_equal [attachments[0].id], ids
+    assert_empty SlackSmokeTransport.requests
+  end
 
   def test_return_fields_and_silent_prefix_are_preserved
     @issue.custom_field_values = {'14' => '1', '12' => '2'}
@@ -777,6 +917,179 @@ class SlackDeliverySmokeTest < SlackWorkflowSmokeTest
     Rails.cache = ActiveSupport::Cache::MemoryStore.new
     @producer = SlackListener.new
     Setting.plugin_redmine_slack = Setting.plugin_redmine_slack.merge('bot_token' => 'fixture-token', 'delivery_enabled' => '1')
+  end
+
+  def with_image_fixtures(images)
+    original = Attachment.method(:find_by)
+    Attachment.define_singleton_method(:find_by) { |id:| images[id] }
+    yield
+  ensure
+    Attachment.define_singleton_method(:find_by, original) if original
+  end
+
+  def test_image_delivery_skips_unavailable_and_falls_back_to_customized_text
+    image = Struct.new(:filename, :diskfile, :image?)
+    Tempfile.create('slack-image') do |file|
+      file.binmode
+      file.write("\x00\xFFabc".b)
+      file.flush
+      fixtures = {1 => image.new('fixture.png', file.path, true), 2 => image.new('missing.png', file.path + '.missing', true), 3 => image.new('document.pdf', file.path, false)}
+      with_image_fixtures(fixtures) do
+        envelope = {'destination' => {'kind' => 'channel', 'id' => 'CFIXTURE1'}, 'text_parts' => ['<https://issue.invalid|Issue>\n>>>\n<@U123>'], 'username' => 'fixture-bot', 'icon_emoji' => ':event:', 'image_attachment_ids' => [1, 2, 3, 4]}
+        SlackSmokeTransport.responses = [[200, '{"ok":true,"upload_url":"https://upload.example.invalid/synthetic","file_id":"F1"}', {}], [200, 'OK', {}], [200, '{"ok":true}', {}]]
+        RedmineSlack::DeliveryJob.perform_now(envelope)
+        requests = SlackSmokeTransport.requests
+        assert_equal 3, requests.length
+        assert_equal({filename: 'fixture.png', length: 5}, requests[0][:body])
+        assert_equal "\x00\xFFabc".b, requests[1][:body]
+        payload = JSON.parse(requests[2][:body])
+        assert_equal [{'id' => 'F1'}], payload['files']
+        assert_equal envelope['text_parts'].first, payload['initial_comment']
+        assert_equal 'CFIXTURE1', payload['channel_id']
+        assert_equal 'fixture-bot', payload['username']
+        assert_equal ':event:', payload['icon_emoji']
+        %w[unfurl_links unfurl_media attachments link_names blocks].each { |key| refute payload.key?(key) }
+        SlackSmokeTransport.requests.clear
+        SlackSmokeTransport.responses = nil
+        envelope['image_attachment_ids'] = [2, 3, 4]
+        RedmineSlack::DeliveryJob.perform_now(envelope)
+        fallback = JSON.parse(SlackSmokeTransport.requests.last[:body])
+        assert SlackSmokeTransport.requests.last[:url].end_with?('/chat.postMessage')
+        assert_equal false, fallback['unfurl_links']
+        assert_equal false, fallback['unfurl_media']
+        assert_equal ':event:', fallback['icon_emoji']
+        assert_equal 'fixture-bot', fallback['username']
+        assert_equal envelope['text_parts'].first, fallback['text']
+        SlackSmokeTransport.requests.clear
+        envelope.delete('image_attachment_ids')
+        RedmineSlack::DeliveryJob.perform_now(envelope)
+        assert_equal 1, SlackSmokeTransport.requests.length
+        SlackSmokeTransport.requests.clear
+        envelope['image_attachment_ids'] = []
+        RedmineSlack::DeliveryJob.perform_now(envelope)
+        assert_equal 1, SlackSmokeTransport.requests.length
+        SlackSmokeTransport.requests.clear
+        envelope['image_attachment_ids'] = [1]
+        SlackSmokeTransport.error = IOError.new('fixture transport error')
+        RedmineSlack::DeliveryJob.perform_now(envelope)
+        assert_equal 1, ActiveJob::Base.queue_adapter.enqueued_jobs.length
+        assert_empty SlackSmokeTransport.requests
+      end
+    end
+  ensure
+    SlackSmokeTransport.responses = nil
+  end
+
+  def test_combined_upload_renders_mentions_and_completes_all_files_once
+    image = Struct.new(:filename, :diskfile, :image?)
+    Tempfile.create('slack-image') do |file|
+      file.write('fixture bytes')
+      file.flush
+      with_image_fixtures(1 => image.new('one.png', file.path, true), 2 => image.new('two.png', file.path, true)) do
+        @executor.rslack_preference[:username] = 'UFIXTURE01'
+        envelope = {'destination' => {'kind' => 'channel', 'id' => 'CFIXTURE1'}, 'text_parts' => ['<https://issue.invalid|Issue>', "\n>>>\n", RedmineSlack::MessageTemplate.mention(@executor)], 'username' => 'bot', 'icon_url' => 'https://example.invalid/icon', 'image_attachment_ids' => [1, 2]}
+        SlackSmokeTransport.responses = [
+          [200, '{"ok":true,"upload_url":"https://upload.example.invalid/synthetic","file_id":"F1"}', {}], [200, 'OK', {}],
+          [200, '{"ok":true,"upload_url":"https://upload.example.invalid/synthetic","file_id":"F2"}', {}], [200, 'OK', {}],
+          [200, '{"ok":true,"files":[]}', {}]
+        ]
+        RedmineSlack::DeliveryJob.perform_now(envelope)
+        assert_equal 5, SlackSmokeTransport.requests.length
+        payload = JSON.parse(SlackSmokeTransport.requests.last[:body])
+        assert_equal [{'id' => 'F1'}, {'id' => 'F2'}], payload['files']
+        assert_equal "<https://issue.invalid|Issue>\n>>>\n<@UFIXTURE01>", payload['initial_comment']
+        assert_equal 'https://example.invalid/icon', payload['icon_url']
+        refute SlackSmokeTransport.requests.any? { |request| request[:url].end_with?('/chat.postMessage') }
+      end
+    end
+  ensure
+    SlackSmokeTransport.responses = nil
+  end
+
+  def test_upload_retry_restarts_after_partial_progress_without_text_substitute
+    image = Struct.new(:filename, :diskfile, :image?)
+    Tempfile.create('slack-image') do |file|
+      file.write('bytes')
+      file.flush
+      with_image_fixtures(1 => image.new('one.png', file.path, true), 2 => image.new('two.png', file.path, true)) do
+        envelope = {'destination' => {'kind' => 'channel', 'id' => 'CFIXTURE1'}, 'text_parts' => ['fixture'], 'image_attachment_ids' => [1, 2]}
+        acquisition = [200, '{"ok":true,"upload_url":"https://upload.example.invalid/synthetic","file_id":"F1"}', {}]
+        raw = [200, 'OK', {}]
+        SlackSmokeTransport.responses = [acquisition, raw, [429, '{}', {'Retry-After' => '7'}]]
+        RedmineSlack::DeliveryJob.perform_now(envelope)
+        queued = ActiveJob::Base.queue_adapter.enqueued_jobs.last
+        assert_in_delta Time.now.to_f + 7, queued[:at], 2
+        assert_equal envelope, ActiveJob::Arguments.deserialize(queued[:args]).first
+        SlackSmokeTransport.requests.clear
+        SlackSmokeTransport.responses = [acquisition, raw, acquisition, raw, [200, '{"ok":true}', {}]]
+        ActiveJob::Base.execute(queued)
+        assert_equal 2, SlackSmokeTransport.requests.count { |r| r[:url].end_with?('/files.getUploadURLExternal') }
+        assert_equal 2, SlackSmokeTransport.requests.count { |r| r[:url] == 'https://upload.example.invalid/synthetic' }
+        refute SlackSmokeTransport.requests.any? { |r| r[:url].end_with?('/chat.postMessage') }
+        ActiveJob::Base.queue_adapter.enqueued_jobs.clear
+        SlackSmokeTransport.requests.clear
+        SlackSmokeTransport.responses = [[200, '{"ok":false,"error":"invalid_auth"}', {}]]
+        RedmineSlack::DeliveryJob.perform_now(envelope)
+        assert_empty ActiveJob::Base.queue_adapter.enqueued_jobs
+        refute SlackSmokeTransport.requests.any? { |r| r[:url].end_with?('/chat.postMessage') }
+        SlackSmokeTransport.requests.clear
+        SlackSmokeTransport.responses = [acquisition, raw, acquisition, raw, [503, '{}', {}]]
+        RedmineSlack::DeliveryJob.perform_now(envelope)
+        assert_equal 1, ActiveJob::Base.queue_adapter.enqueued_jobs.length
+        refute SlackSmokeTransport.requests.any? { |r| r[:url].end_with?('/chat.postMessage') }
+      end
+    end
+  ensure
+    SlackSmokeTransport.responses = nil
+  end
+
+  def test_comment_producer_queues_only_image_ids_and_preserves_original_note
+    Setting.text_formatting = 'common_mark'
+    image = Struct.new(:id, :filename, :created_on, :image?) do
+      def diskfile; raise 'producer must not read files'; end
+    end.new(123456, 'fixture.png', Time.at(1), true)
+    @issue.define_singleton_method(:attachments) { [image] }
+    journal = @issue.init_journal(@user, 'Before ![fixture](fixture.png) after')
+    journal.define_singleton_method(:attachments) { [image] }
+    @producer.define_singleton_method(:channel_for_project) { |_project| 'CFIXTURE1' }
+    @producer.define_singleton_method(:is_client) { |_user, _project| false }
+    @producer.notify_issue_update(issue: @issue, journal: journal)
+    envelopes = ActiveJob::Base.queue_adapter.enqueued_jobs.map { |job| ActiveJob::Arguments.deserialize(job[:args]).first }
+    envelope = envelopes.find { |item| item['image_attachment_ids'] }
+    assert envelope
+    assert_equal [123456], envelope['image_attachment_ids']
+    assert_equal 'Before ![fixture](fixture.png) after', journal.notes
+    assert_includes envelope['text_parts'].grep(String).join, 'Before  after'
+    refute_includes envelope.to_json, 'fixture.png'
+    refute_includes envelope.to_json, 'fixture-token'
+    assert_equal ['image_attachment_ids'], envelope.keys.grep(/image|upload/)
+    assert_empty SlackSmokeTransport.requests
+  end
+
+  def test_private_and_blank_notes_never_queue_comment_images
+    Setting.text_formatting = 'common_mark'
+    image = Struct.new(:id, :filename, :created_on, :image?) do
+      def diskfile; raise 'producer must not read files'; end
+    end.new(123456, 'fixture.png', Time.at(1), true)
+    @issue.define_singleton_method(:attachments) { [image] }
+    @producer.define_singleton_method(:channel_for_project) { |_project| 'CFIXTURE1' }
+    @producer.define_singleton_method(:prepare_details_change_message) { |_issue, _journal, _msg| ['Fixture update', {}] }
+    journal = @issue.init_journal(@user, 'Private ![fixture](fixture.png)')
+    journal.private_notes = true
+    journal.define_singleton_method(:attachments) { [image] }
+    @producer.notify_issue_update(issue: @issue, journal: journal)
+    jobs = ActiveJob::Base.queue_adapter.enqueued_jobs
+    assert jobs.any?
+    refute_includes jobs.map { |job| job[:args] }.to_json, 'Private'
+    refute_includes jobs.map { |job| job[:args] }.to_json, 'image_attachment_ids'
+    assert_empty SlackSmokeTransport.requests
+    jobs.clear
+    @producer.define_singleton_method(:prepare_details_change_message) { |_issue, _journal, msg| [msg, {}] }
+    journal.private_notes = false
+    journal.notes = ''
+    @producer.notify_issue_update(issue: @issue, journal: journal)
+    assert_empty jobs
+    assert_empty SlackSmokeTransport.requests
   end
 
   def test_switch_and_legacy_endpoint_never_enqueue

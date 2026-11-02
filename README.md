@@ -28,9 +28,9 @@ The migration adds no gem, table, or schema migration. Restart Redmine after
 installing or upgrading the plugins so that the queue registration takes effect.
 
 Create a Slack app, install it in the workspace, and grant these bot scopes:
-`chat:write`, `chat:write.customize`, `users:read.email`, `im:write`, and
+`chat:write`, `chat:write.customize`, `users:read.email`, `im:write`, `files:write`, and
 `groups:read` (used only for channel conversion). `chat:write.public` is not
-required. Enable the App Home Messages Tab; replies can remain disabled.
+required. Scope changes require reinstalling the app. Enable the App Home Messages Tab; replies can remain disabled.
 See Slack's documentation for [posting](https://docs.slack.dev/reference/methods/chat.postMessage/),
 [email lookup](https://docs.slack.dev/reference/methods/users.lookupByEmail/),
 [opening DMs](https://docs.slack.dev/reference/methods/conversations.open/), and
@@ -68,6 +68,11 @@ A timed-out request may have been accepted by Slack and a retry can duplicate it
 Permanent errors are dropped with a safe code. Successful member lookups and DM
 channels are cached for 24 hours; a cold cache after a restart performs lookups
 again, and an email change can reuse a cached member until expiry.
+
+Comment notifications include image attachments added in the same journal and
+existing issue images referenced inline. Image markup is stripped only from the
+Slack copy; missing images are skipped at delivery, and retries can duplicate
+the resulting message.
 
 Database backups include this setting. Keep it off on local and maintenance
 copies. To disable it from the upgraded Redmine root:
