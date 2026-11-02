@@ -15,9 +15,9 @@ namespace :redmine_slack do
         break if cursor.blank?
       end
     rescue RedmineSlack::RateLimitError => error
-      raise "Slack conversion: ratelimited retry_after=#{error.wait}"
+      raise "Slack conversion: ratelimited retry_after=#{error.wait}", cause: nil
     rescue RedmineSlack::TransientError, RedmineSlack::DropError => error
-      raise "Slack conversion: #{error.message}"
+      raise "Slack conversion: #{error.message}", cause: nil
     end
 
     fields = ProjectCustomField.where(name: ['Slack Channel', 'Slack Support Channel']).index_by(&:id)

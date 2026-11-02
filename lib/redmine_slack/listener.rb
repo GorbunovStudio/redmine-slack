@@ -515,7 +515,7 @@ private
         end
 
         if (issue.assigned_to.id == journal.user.id)            
-            msg  = previous_owner + ["Story was captured by #{issue.assigned_to.to_s}"]
+            msg  = previous_owner + ["Story was captured by #{escape issue.assigned_to.to_s}"]
             #icon = get_avatar_url(issue.assigned_to.mail)
         else
             msg  = previous_owner + ["Issue was transferred to ", RedmineSlack::MessageTemplate.mention(issue.assigned_to), " (by #{escape journal.user.to_s})"]
@@ -871,7 +871,7 @@ private
     end
 
     def format_issue_for_list(issue)
-        return "• #{issue.project.name} - <#{object_url issue}|#{issue.tracker.name} ##{issue.id}: #{issue.subject}> (#{issue.status.name}) [#{issue.priority.name}]"
+        return "• #{escape issue.project.name} - <#{object_url issue}|#{escape issue.tracker.name} ##{issue.id}: #{escape issue.subject}> (#{escape issue.status.name}) [#{escape issue.priority.name}]"
     end
 
     def build_review_list(recipient = User.current)

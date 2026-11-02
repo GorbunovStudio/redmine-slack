@@ -64,7 +64,7 @@ module RedmineSlack
       begin
         payload = JSON.parse(response.body.to_s)
       rescue JSON::ParserError
-        raise DropError, 'invalid_response'
+        raise DropError, 'invalid_response', cause: nil
       end
       raise DropError, 'invalid_response' unless payload.is_a?(Hash)
       return payload if payload['ok'] == true
@@ -75,9 +75,9 @@ module RedmineSlack
       code = 'unknown_error' unless code.match?(/\A[a-z_]+\z/)
       raise DropError, code
     rescue HTTPClient::BadResponseError
-      raise DropError, 'invalid_response'
+      raise DropError, 'invalid_response', cause: nil
     rescue HTTPClient::TimeoutError, IOError, SystemCallError, SocketError, Timeout::Error, OpenSSL::SSL::SSLError
-      raise TransientError, 'transport_error'
+      raise TransientError, 'transport_error', cause: nil
     end
 
     def rate_limit!(response)

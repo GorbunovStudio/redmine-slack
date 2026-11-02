@@ -80,6 +80,11 @@ Conversion SHALL finish enumeration before applying writes in one transaction, r
 - **THEN** the task exits without persistent changes and reports only a safe error code or status
 - **AND** a supplied Retry-After wait can be reported without disclosing the token
 
+#### Scenario: Sensitive exception text is excluded from diagnostics
+- **WHEN** an external listing error contains a token, email, or response content
+- **THEN** the conversion error and its cause chain do not retain or disclose the original exception text
+- **AND** enumeration failure leaves stored settings and project values unchanged
+
 #### Scenario: Rerun after conversion
 - **WHEN** the task is run after names have been converted to IDs
 - **THEN** it reports those IDs unchanged and does not convert them again

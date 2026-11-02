@@ -37,6 +37,22 @@ Generated mention placeholders SHALL render as `<@U…>` or `<@W…>` only after
 - **THEN** only placeholders generated from actual Redmine-user references are resolved
 - **AND** the literal comment text is not interpreted as a user reference
 
+### Requirement: Escape user-controlled Slack text
+The plugin SHALL escape `&`, `<`, and `>` in user-controlled comment text outside recognized Redmine-login mentions, captured-assignee names, and reminder-list display values before composing Slack messages. Generated mentions, issue links, and broadcast alerts MUST retain their Slack syntax.
+
+#### Scenario: Literal Slack controls in a comment remain text
+- **WHEN** a comment contains literal Slack control syntax, ordinary text with Slack control characters, and a recognized Redmine login
+- **THEN** the literal controls and ordinary text are escaped
+- **AND** the recognized login becomes a resolved Slack mention
+
+#### Scenario: User-controlled names and reminder values remain text
+- **WHEN** a captured-assignee name or a reminder entry's project, tracker, subject, status, or priority contains Slack control characters
+- **THEN** those display values are escaped without breaking the generated issue link
+
+#### Scenario: Generated broadcast remains active
+- **WHEN** the plugin composes a high-priority alert
+- **THEN** its generated `<!channel>` broadcast syntax remains unescaped
+
 ### Requirement: Recognize only existing Redmine logins in comments
 Comment conversion SHALL recognize `@word` only at start-of-text or after a non-word character before `@`, and only when it identifies an existing Redmine login. That boundary MUST preserve email addresses without separate email-span exclusion. Unknown handles MUST remain unchanged; mention-based support routing and duplicate suppression MUST use the same recognized Redmine identities.
 

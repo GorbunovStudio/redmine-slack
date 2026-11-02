@@ -124,8 +124,16 @@ class SlackClientSmokeTest < ActiveSupport::TestCase
     SlackSmokeTransport.error = IOError.new('xoxb-synthetic-secret fixture@example.invalid')
     error = assert_raises(RedmineSlack::TransientError) { @client.lookup_by_email('fixture@example.invalid') }
     assert_equal 'transport_error', error.message
+    assert_nil error.cause
     SlackSmokeTransport.error = HTTPClient::ReceiveTimeoutError.new('xoxb-synthetic-secret fixture@example.invalid')
-    assert_equal 'transport_error', assert_raises(RedmineSlack::TransientError) { @client.post_message({}) }.message
+    error = assert_raises(RedmineSlack::TransientError) { @client.post_message({}) }
+    assert_equal 'transport_error', error.message
+    assert_nil error.cause
+    SlackSmokeTransport.error = HTTPClient::BadResponseError.new('xoxb-synthetic-secret fixture@example.invalid')
+    assert_nil assert_raises(RedmineSlack::DropError) { @client.post_message({}) }.cause
+    SlackSmokeTransport.error = nil
+    SlackSmokeTransport.body = 'xoxb-synthetic-secret fixture@example.invalid'
+    assert_nil assert_raises(RedmineSlack::DropError) { @client.post_message({}) }.cause
   end
 end
 
@@ -355,6 +363,24 @@ class SlackConversionSmokeTest < SlackWorkflowSmokeTest
     run_conversion(apply: true, pages: [@pages.first, [403, '{"ok":false,"error":"invalid_auth"}', {}]])
     assert_equal 'Slack conversion: http_403', @conversion_error
     assert_equal '#fixture-convert', Setting.plugin_redmine_slack['channel']
+  end
+
+  def test_sensitive_transport_error_has_no_unsafe_cause_or_writes
+    original_settings = Setting.plugin_redmine_slack.deep_dup
+    original_values = @values.map { |value| value.reload.value }
+    ENV['APPLY'] = '1'
+    SlackSmokeTransport.error = IOError.new('xoxb-synthetic-secret fixture@example.invalid')
+    task = Rake::Task['redmine_slack:convert_channels']
+    task.reenable
+    error = assert_raises(RuntimeError) { task.invoke }
+    assert_equal 'Slack conversion: transport_error', error.message
+    while error
+      refute_includes error.message, 'xoxb-synthetic-secret'
+      refute_includes error.message, 'fixture@example.invalid'
+      error = error.cause
+    end
+    assert_equal original_settings, Setting.plugin_redmine_slack
+    assert_equal original_values, @values.map { |value| value.reload.value }
   end
 end
 
@@ -798,6 +824,67 @@ class SlackDeliverySmokeTest < SlackWorkflowSmokeTest
     assert_equal 'fixture-bot', payload['username']
     assert_equal [{'text' => 'attachment'}], payload['attachments']
     refute payload.key?('link_names')
+  end
+
+  def test_comment_payload_escapes_literal_controls_but_resolves_login
+    @executor.update_columns(login: 'fixture.comment-user')
+    @executor.rslack_preference[:username] = 'UFIXTURE01'
+    @producer.define_singleton_method(:is_client) { |_user, _project| false }
+    executor = @executor
+    @producer.define_singleton_method(:get_executor) { |_issue| executor }
+    journal = @issue.init_journal(@user, "<!channel> <@U012AB3CD> a < b & c @#{@executor.login}")
+    parts, = @producer.send(:prepare_comment_message, @issue, journal, 'CFIXTURE1')
+    @producer.speak(parts, 'CFIXTURE1')
+    envelope = ActiveJob::Arguments.deserialize(ActiveJob::Base.queue_adapter.enqueued_jobs.last[:args]).first
+    RedmineSlack::DeliveryJob.perform_now(envelope)
+    text = JSON.parse(SlackSmokeTransport.requests.last[:body])['text']
+    assert_includes text, '&lt;!channel&gt;'
+    assert_includes text, '&lt;@U012AB3CD&gt;'
+    assert_includes text, 'a &lt; b &amp; c'
+    assert_includes text, '<@UFIXTURE01>'
+    refute_includes text, '<!channel>'
+    refute_includes text, '<@U012AB3CD>'
+  end
+
+  def test_reminder_payload_keeps_issue_link_and_escapes_display_values
+    @issue.project.name = 'Project & <control>'
+    @issue.tracker.name = 'Tracker & <control>'
+    @issue.subject = 'ordinary> <!here>'
+    @issue.status.name = 'Status & <control>'
+    @issue.priority.name = 'Priority & <control>'
+    entry = @producer.send(:format_issue_for_list, @issue)
+    @producer.speak(entry, 'CFIXTURE1')
+    envelope = ActiveJob::Arguments.deserialize(ActiveJob::Base.queue_adapter.enqueued_jobs.last[:args]).first
+    RedmineSlack::DeliveryJob.perform_now(envelope)
+    text = JSON.parse(SlackSmokeTransport.requests.last[:body])['text']
+    assert_includes text, 'Project &amp; &lt;control&gt;'
+    assert_includes text, "<#{@producer.send(:object_url, @issue)}|Tracker &amp; &lt;control&gt; ##{@issue.id}: ordinary&gt; &lt;!here&gt;>"
+    assert_includes text, '(Status &amp; &lt;control&gt;)'
+    assert_includes text, '[Priority &amp; &lt;control&gt;]'
+    assert_equal 1, text.scan(/<[^>]*>/).length
+    refute_includes text, '<!here>'
+  end
+
+  def test_captured_assignee_is_escaped_and_generated_broadcast_remains_active
+    @user.firstname = 'Name & <control>'
+    @issue.assigned_to = @user
+    journal = @issue.init_journal(@user, '')
+    journal.details.build(property: 'attr', prop_key: 'assigned_to_id', old_value: '1', value: @user.id.to_s)
+    @producer.define_singleton_method(:is_story) { |_issue| true }
+    parts, = @producer.send(:prepare_assigned_change_message, @issue, journal)
+    @producer.speak(parts, 'CFIXTURE1')
+    envelope = ActiveJob::Arguments.deserialize(ActiveJob::Base.queue_adapter.enqueued_jobs.last[:args]).first
+    RedmineSlack::DeliveryJob.perform_now(envelope)
+    text = JSON.parse(SlackSmokeTransport.requests.last[:body])['text']
+    assert_includes text, 'Story was captured by Name &amp; &lt;control&gt;'
+    refute_includes text, '<control>'
+
+    @producer.define_singleton_method(:channel_for_project) { |_project| 'CFIXTURE1' }
+    @issue.priority_id = 5
+    @producer.controller_issues_new_after_save(issue: @issue)
+    envelope = ActiveJob::Arguments.deserialize(ActiveJob::Base.queue_adapter.enqueued_jobs.last[:args]).first
+    RedmineSlack::DeliveryJob.perform_now(envelope)
+    assert JSON.parse(SlackSmokeTransport.requests.last[:body])['text'].start_with?('<!channel>')
   end
 
   def test_unresolvable_dm_is_skipped_and_resolved_dm_uses_opened_channel
