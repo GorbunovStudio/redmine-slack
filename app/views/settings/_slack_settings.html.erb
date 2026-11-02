@@ -5,8 +5,9 @@
 </p>
 
 <p>
-	<label for="settings_slack_url">Slack URL</label>
-	<input type="text" id="settings_slack_url" size=80 value="<%= settings['slack_url'] %>" name="settings[slack_url]" />
+	<label for="settings_bot_token">Slack bot token</label>
+	<%= password_field_tag 'settings[bot_token]', '', autocomplete: 'new-password', aria: {describedby: 'slack-bot-token-status'} %>
+	<span id="slack-bot-token-status"><%= settings['bot_token'].present? ? 'Configured' : 'Not configured' %></span>
 </p>
 
 <p>
@@ -15,8 +16,10 @@
 </p>
 
 <p>
-	The channel can be changed on a per-project basis by creating a
-	<a href="/custom_fields/new?type=ProjectCustomField">project custom field</a> named "Slack Channel" (without quotes).
+	Use a private conversation ID (C… or G…) and invite the bot. Create
+	<a href="/custom_fields/new?type=ProjectCustomField">project custom fields</a>
+	named "Slack Channel" and "Slack Support Channel" for per-project routes.
+	Blank values inherit; a nonblank invalid value or - disables that route.
 </p>
 
 <p>

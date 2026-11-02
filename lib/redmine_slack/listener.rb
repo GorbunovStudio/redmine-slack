@@ -32,7 +32,6 @@ class SlackListener
     PROGRESS_EVENT_STORY_PASSED_TESTING    = 'story_passed_testing'
     PROGRESS_EVENT_STORY_ACCEPTED          = 'story_accepted'
 
-    @users_map            = nil
     @silent_update        = false
     @isReturn             = false
     @previous_assigned_to = nil
@@ -46,14 +45,12 @@ class SlackListener
         return unless SlackListener::ISSUE_HIGH_PRIORITIES.include?(issue.priority.id) #No creation notifications for now
 
         channel = channel_for_project issue.project
-        url = url_for_project issue.project
-
-        return unless channel and url
+        return unless channel
 
         attachment = prepare_issue_description(issue)
-        msg = '@channel: important issue was created!'
+        msg = '<!channel> important issue was created!'
         msg += "\n\n<#{object_url issue}|#{escape issue}>"
-        speak msg, channel, [attachment], url
+        speak msg, channel, [attachment]
 
         return
 
@@ -81,7 +78,7 @@ class SlackListener
             :short => true
         } if Setting.plugin_redmine_slack[:display_watchers] == 'yes'
 
-        speak msg, channel, [attachment], url
+        speak msg, channel, [attachment]
     end  
 
     def prepare_issue_update(context={})
@@ -124,15 +121,11 @@ class SlackListener
             channel = channel_for_project(issue.project)
         end
         
-        url = url_for_project issue.project
-
-        return unless channel and url and slack_settings[:post_updates] == '1'
+        return unless channel and slack_settings[:post_updates] == '1'
 
         msg         = ""
         attachments = []
         icon_emoji  = nil
-
-        @users_map = prepare_users_map
 
         progress_event = get_progress_event(issue, journal)
 
@@ -148,7 +141,7 @@ class SlackListener
             msg, attachment, icon_emoji, reviewerPM = prepare_return_message(issue, journal)
 
             if !reviewerPM.blank? 
-                speak reviewerPM[:text], reviewerPM[:channel], reviewerPM[:attachments], url
+                speak reviewerPM[:text], reviewerPM[:channel], reviewerPM[:attachments]
             end
         end
 
@@ -166,18 +159,18 @@ class SlackListener
         end
         
         if msg != ""
-            speak msg, channel, attachments, url, icon_emoji
+            speak msg, channel, attachments, icon_emoji
         end
 
 
         msg, channel = prepare_comment_message(issue, journal, channel)
         if msg != ""
-            speak msg, channel, [], url
+            speak msg, channel, []
         end
         
         msg, attachment = prepare_priority_change_message(issue, journal)
         if !attachment.blank?
-            speak msg, channel, [attachment], url
+            speak msg, channel, [attachment]
         end
 
 
@@ -186,19 +179,19 @@ class SlackListener
             executor      = get_executor(issue)
 
             if !executor.nil?
-                executor_mention = get_slack_username(executor.login)
+                executor_mention = executor
 
                 if can_review_code(executor, issue.project)
                     msg = build_review_list(executor)
 
                     if !msg.blank?
-                        speak msg, executor_mention, [{}], url
+                        speak msg, executor_mention, [{}]
                     end
                 end
 
                 msg = build_assigned_list(executor)
                 if !msg.blank?
-                    speak msg, executor_mention, [{}], url
+                    speak msg, executor_mention, [{}]
                 end
             end
         end
@@ -210,9 +203,7 @@ class SlackListener
         changeset = context[:changeset]
 
         channel = channel_for_project issue.project
-        url = url_for_project issue.project
-
-        return unless channel and url and issue.save
+        return unless channel and issue.save
 
         repository = changeset.repository
 
@@ -231,40 +222,33 @@ class SlackListener
         attachment[:fields] = journal.details.map { |d| detail_to_field d }.compact
 
         msg = "#{escape journal.user} updated <#{object_url issue}|#{escape issue}>"
-        speak msg, channel, [attachment], url
+        speak msg, channel, [attachment]
     end
 
-    def speak(msg, channel, attachments=[], url=nil, icon_emoji=nil)
+    def speak(msg, channel, attachments=[], icon_emoji=nil)
         return unless delivery_enabled?
-        url = slack_settings[:slack_url] if not url
-        return if url.blank? || channel.blank?
-        username = slack_settings[:username]
-        icon = slack_settings[:icon]
-
-        params = {
-            :text => msg,
-            :link_names => 1,
-        }
-
-        params[:username] = username if username
-        params[:channel] = channel if channel
-
-        params[:attachments] = attachments if !attachments.blank?
-
-        if icon and not icon.blank?
+        settings = slack_settings
+        return if settings[:bot_token].blank? || channel.blank?
+        destination = if channel.is_a?(User)
+            {'kind' => 'user', 'user_id' => channel.id}
+        elsif channel.to_s.match?(/\A[CG][A-Z0-9]+\z/)
+            {'kind' => 'channel', 'id' => channel}
+        end
+        return unless destination
+        envelope = {'destination' => destination, 'text_parts' => msg.is_a?(Array) ? msg : [msg]}
+        envelope['username'] = settings[:username] if settings[:username]
+        envelope['attachments'] = attachments if !attachments.blank?
+        icon = settings[:icon]
+        if icon.present?
             if icon.start_with? ':'
-                params[:icon_emoji] = icon
+                envelope['icon_emoji'] = icon
             else
-                params[:icon_url] = icon
+                envelope['icon_url'] = icon
             end
         end
-
-        params[:icon_emoji] = icon_emoji if icon_emoji
-
-        payload = params.to_json
-        ActiveRecord.after_all_transactions_commit do
-            deliver(url, payload) if delivery_enabled?
-        end
+        envelope.delete('icon_url') if icon_emoji
+        envelope['icon_emoji'] = icon_emoji if icon_emoji
+        RedmineSlack::DeliveryJob.perform_later(envelope)
     end
 
 private
@@ -274,43 +258,6 @@ private
 
     def slack_settings
         Setting.plugin_redmine_slack.with_indifferent_access
-    end
-
-    def deliver(url, payload)
-        client = HTTPClient.new
-        client.ssl_config.cert_store.set_default_paths
-        client.connect_timeout = 5
-        client.send_timeout = 5
-        client.receive_timeout = 5
-        response = client.post(url, payload: payload)
-        Rails.logger.warn("Slack delivery rejected (HTTP #{response.status})") unless (200..299).cover?(response.status)
-    rescue StandardError => error
-        Rails.logger.warn("Slack delivery failed (#{error.class})")
-    end
-
-    def prepare_users_map
-        users = User.sorted.active.preload(:preference)
-
-        users_map = {}
-
-        users.each do |u|
-          slack_username = u.rslack_preference[:username]
-          unless (slack_username == "")
-            users_map[u.login] = slack_username
-          else 
-            users_map[u.login] = u.login.downcase
-          end
-        end
-
-        return users_map
-    end
-
-    def get_users_map
-        if @users_map.nil?
-            @users_map = prepare_users_map
-        end
-
-        return @users_map
     end
 
     def get_avatar_url(email)
@@ -400,7 +347,7 @@ private
 
     def prepare_progress_message(issue, journal, progress_event)
         executor      = get_executor(issue)
-        executor_mention = executor.nil? ? "" : mention_user(executor.login)
+        executor_mention = executor.nil? ? "" : RedmineSlack::MessageTemplate.mention(executor)
         msg = ""
         attachment = {}
         icon = nil
@@ -423,15 +370,15 @@ private
         end
 
         if progress_event == SlackListener::PROGRESS_EVENT_STORY_PASSED_THE_REVIEW 
-            msg = "#{executor_mention}, good job! Your story just passed the Review! :thumbsup: Let's test it a little :smirk::smirk::smirk:"
+            msg = [executor_mention, ", good job! Your story just passed the Review! :thumbsup: Let's test it a little :smirk::smirk::smirk:"]
         end
 
         if progress_event == SlackListener::PROGRESS_EVENT_STORY_PASSED_TESTING 
-            msg = "#{executor_mention}, great, looks like you hid your bugs thoroughly! :ok_hand:"
+            msg = [executor_mention, ", great, looks like you hid your bugs thoroughly! :ok_hand:"]
         end
 
         if progress_event == SlackListener::PROGRESS_EVENT_STORY_ACCEPTED 
-            msg = "#{executor_mention}, fantastic!!! Your story was just accepted! :tada::tada::tada: Mission accomplished :sunglasses::sunglasses::sunglasses:"
+            msg = [executor_mention, ", fantastic!!! Your story was just accepted! :tada::tada::tada: Mission accomplished :sunglasses::sunglasses::sunglasses:"]
             icon_emoji = ':tada_dongler:'
         end
 
@@ -445,11 +392,10 @@ private
             attachment[:color] = "good"
             
             if (issue.assigned_to != nil && issue.assigned_to.id != journal.user.id) 
-                assigned_user = mention_user(issue.assigned_to.login)
-                msg += " #{assigned_user}, it's your turn now!"
+                msg = Array(msg) + [' ', RedmineSlack::MessageTemplate.mention(issue.assigned_to), ", it's your turn now!"]
             end
 
-            msg += "\n\n<#{object_url issue}|#{escape issue}>"
+            msg = Array(msg) + ["\n\n<#{object_url issue}|#{escape issue}>"]
         end
 
         if !icon.nil?
@@ -461,7 +407,6 @@ private
 
     def prepare_return_message(issue, journal)
         executor      = get_executor(issue)
-        executor_mention = executor.nil? ? "" : mention_user(executor.login)
         msg        = ""
         attachment = {}
         icon       = nil
@@ -490,8 +435,7 @@ private
             return msg, attachment, icon_emoji, reviewerPM
         end
             
-        assigned_user = mention_user(issue.assigned_to.login)
-        msg = "#{assigned_user} Issue was returned :cry::cry::cry: to you (by #{escape journal.user.to_s})"
+        msg = [RedmineSlack::MessageTemplate.mention(issue.assigned_to), " Issue was returned :cry::cry::cry: to you (by #{escape journal.user.to_s})"]
         icon = get_avatar_url(issue.assigned_to.mail)
 
         attachment = prepare_issue_description(issue)
@@ -507,15 +451,15 @@ private
                 manager     = get_manager(issue)
 
                 if !reviewer.nil?
-                    msg += " " + mention_user(reviewer.login)
+                    msg += [' ', RedmineSlack::MessageTemplate.mention(reviewer)]
                 end
 
                 if !tester.nil?
-                    msg += " " + mention_user(tester.login)
+                    msg += [' ', RedmineSlack::MessageTemplate.mention(tester)]
                 end
 
                 if !manager.nil?
-                    msg += " " + mention_user(manager.login)
+                    msg += [' ', RedmineSlack::MessageTemplate.mention(manager)]
                 end
             else 
                 if !reviewer.nil?
@@ -526,7 +470,7 @@ private
                     reviewerPM = {
                         :text => reviewerMsg,
                         :attachments => [reviewerAttachment],
-                        :channel => get_slack_username(reviewer.login)
+                        :channel => reviewer
                     }
                 end
             end
@@ -541,7 +485,7 @@ private
             attachment[:thumb_url] = icon
         end
 
-        msg += "\n\n<#{object_url issue}|#{escape issue}>"
+        msg += ["\n\n<#{object_url issue}|#{escape issue}>"]
 
         return msg, attachment, icon_emoji, reviewerPM
     end
@@ -565,20 +509,19 @@ private
             return msg, attachment, icon_emoji
         end
 
-        previous_owner = ""
+        previous_owner = []
         if !@previous_assigned_to.nil? && @previous_assigned_to.id != journal.user.id
-            previous_owner = mention_user(@previous_assigned_to.login) + ", "
+            previous_owner = [RedmineSlack::MessageTemplate.mention(@previous_assigned_to), ", "]
         end
 
         if (issue.assigned_to.id == journal.user.id)            
-            msg  = "#{previous_owner}Story was captured by #{issue.assigned_to.to_s}"
+            msg  = previous_owner + ["Story was captured by #{escape issue.assigned_to.to_s}"]
             #icon = get_avatar_url(issue.assigned_to.mail)
         else
-            assigned_user = mention_user(issue.assigned_to.login)
-            msg  = "#{previous_owner}Issue was transferred to #{assigned_user} (by #{escape journal.user.to_s})"
+            msg  = previous_owner + ["Issue was transferred to ", RedmineSlack::MessageTemplate.mention(issue.assigned_to), " (by #{escape journal.user.to_s})"]
         end
 
-        msg += "\n\n<#{object_url issue}|#{escape issue}>"
+        msg += ["\n\n<#{object_url issue}|#{escape issue}>"]
 
         attachment = prepare_issue_description(issue)
         #attachment[:pretext] = msg
@@ -598,29 +541,22 @@ private
         end
 
 
-        redmine_mentions = extract_usernames(journal.notes)
+        comment, redmine_mentions = RedmineSlack::MessageTemplate.tokenize(journal.notes)
 
-        redmine_mentions.each do |user_login|
-            user = User.find_by_login(user_login)
-
-            if !user.nil? && is_client(user, issue.project)
+        redmine_mentions.each do |user|
+            if is_client(user, issue.project)
                 channel = support_channel_for_project(issue.project)
                 break
             end
         end
 
 
-        comment = convert_usernames_to_slack(journal.notes)
-        
-        comment_mentions = extract_usernames(comment)
-
-
-        mention = ""
+        comment_mentions = redmine_mentions.map(&:id)
+        mention = []
 
         if (!issue.assigned_to.nil? && issue.assigned_to.id != journal.user.id)             
-            slack_name = get_slack_username(issue.assigned_to.login)
-            if !comment_mentions.include? slack_name
-                mention +=  mention_user(issue.assigned_to.login) + " "
+            if !comment_mentions.include? issue.assigned_to.id
+                mention += [RedmineSlack::MessageTemplate.mention(issue.assigned_to), " "]
             end 
             
         end
@@ -628,9 +564,8 @@ private
         executor = get_executor(issue)
 
         if (!executor.nil? && executor.id != journal.user.id && (issue.assigned_to.nil? || issue.assigned_to.id != executor.id)) 
-            slack_name = get_slack_username(executor.login)
-            if !comment_mentions.include? slack_name
-                mention += mention_user(executor.login) + " "
+            if !comment_mentions.include? executor.id
+                mention += [RedmineSlack::MessageTemplate.mention(executor), " "]
             end             
         end
         
@@ -639,9 +574,7 @@ private
             msg = "<#{object_url issue}|#{escape issue}>"
         end       
 
-        msg += "\n\n" + mention + "#{escape journal.user.to_s} commented:"
-
-        msg += "\n>>>\n" + comment
+        msg = [msg, "\n\n"] + mention + ["#{escape journal.user.to_s} commented:", "\n>>>\n"] + comment
 
         return msg, channel
     end
@@ -667,19 +600,19 @@ private
             attachment[:thumb_url] = get_avatar_url(journal.user.mail)
         end
 
-       mention = ""
+       mention = []
 
         if (!issue.assigned_to.nil? && issue.assigned_to.id != journal.user.id) 
-            mention += mention_user(issue.assigned_to.login) + " "
+            mention += [RedmineSlack::MessageTemplate.mention(issue.assigned_to), " "]
         end
 
         executor      = get_executor(issue)
 
         if (!executor.nil? && executor.id != journal.user.id && (issue.assigned_to.nil? || issue.assigned_to.id != executor.id)) 
-            mention += mention + mention_user(executor.login) + " "
+            mention += mention + [RedmineSlack::MessageTemplate.mention(executor), " "]
         end
 
-        msg = mention + msg
+        msg = mention + Array(msg)
 
         attachment[:fields]   = fields
 
@@ -698,28 +631,12 @@ private
         issueIsImportantNow = SlackListener::ISSUE_HIGH_PRIORITIES.include?(issue.priority_id)
         
         if !issueWasImportant && issueIsImportantNow
-            msg = '@channel: issue priority has been raised!'
+            msg = '<!channel> issue priority has been raised!'
             msg += "\n\n<#{object_url issue}|#{escape issue}>"
             attachment = prepare_issue_description(issue)
         end
 
         return msg, attachment
-    end
-
-    def mention_user(username)
-        slack_name = get_slack_username(username)
-
-        return "<@#{slack_name}>"
-    end
-
-    def get_slack_username(username) 
-        users_map = get_users_map()
-        
-        if users_map.key?(username)
-            return users_map[username]
-        else 
-            return username.downcase
-        end
     end
 
     def is_assigned_user_changed?(journal)
@@ -824,18 +741,6 @@ private
         Rails.application.routes.url_for(obj.event_url({:host => Setting.host_name, :protocol => Setting.protocol}))
     end
 
-    def url_for_project(proj)
-        return nil if proj.blank?
-
-        cf = ProjectCustomField.find_by_name("Slack URL")
-
-        return [
-            (proj.custom_field_value(cf.id) if cf),
-            (url_for_project proj.parent),
-            slack_settings[:slack_url],
-        ].find{|v| v.present?}
-    end
-
     def channel_for_project(proj)
         return nil if proj.blank?
 
@@ -847,7 +752,7 @@ private
             slack_settings[:channel],
         ].find{|v| v.present?}
 
-        if val.to_s.starts_with? '#'
+        if val.to_s.match?(/\A[CG][A-Z0-9]+\z/)
             val
         else
             nil
@@ -865,7 +770,7 @@ private
             (channel_for_project proj),            
         ].find{|v| v.present?}
 
-        if val.to_s.starts_with? '#'
+        if val.to_s.match?(/\A[CG][A-Z0-9]+\z/)
             val
         else
             nil
@@ -910,23 +815,6 @@ private
     #    names = extract_usernames text
     #    names.present? ? "\nTo: @" + names.map(&:downcase).join(', @') : nil
     #end
-
-    def convert_usernames_to_slack text
-        users_map = get_users_map()
-
-        text = text.gsub(/@([a-zA-Z0-9][a-zA-Z0-9_\-.]*)/) { |username| 
-            mention_user(Regexp.last_match[1])
-        }
-
-        text
-    end
-
-    def extract_usernames text = ''
-        # slack usernames may only contain lowercase letters, numbers,
-        # dashes and underscores and must start with a letter or number.
-        text.scan(/(?<=@)[a-zA-Z0-9][a-zA-Z0-9_\-]*/).uniq
-    end
-
 
     def detail_to_field_full(detail)
         if detail.property == "cf"
@@ -983,7 +871,7 @@ private
     end
 
     def format_issue_for_list(issue)
-        return "• #{issue.project.name} - <#{object_url issue}|#{issue.tracker.name} ##{issue.id}: #{issue.subject}> (#{issue.status.name}) [#{issue.priority.name}]"
+        return "• #{escape issue.project.name} - <#{object_url issue}|#{escape issue.tracker.name} ##{issue.id}: #{escape issue.subject}> (#{escape issue.status.name}) [#{escape issue.priority.name}]"
     end
 
     def build_review_list(recipient = User.current)

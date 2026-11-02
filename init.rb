@@ -2,15 +2,22 @@ require 'redmine'
 
 Rails.autoloaders.main.ignore(File.join(__dir__, 'lib'))
 require_relative 'lib/redmine_slack/view_hooks'
+require_relative 'lib/redmine_slack/client'
+require_relative 'lib/redmine_slack/message_template'
+require_relative 'lib/redmine_slack/member_resolver'
 require_relative 'lib/redmine_slack/listener'
 require_relative 'lib/redmine_slack_user_patch'
 require_relative 'lib/redmine_slack_my_controller_patch'
 require_relative 'lib/redmine_slack_users_controller_patch'
+require_relative 'lib/redmine_slack_settings_patch'
+
+Rails.application.config.filter_parameters += [:bot_token]
 
 prepare_patches = proc do
 	User.include RedmineSlack::UserPatch unless User < RedmineSlack::UserPatch
 	MyController.include RedmineSlack::MyControllerPatch unless MyController < RedmineSlack::MyControllerPatch
 	UsersController.include RedmineSlack::UsersControllerPatch unless UsersController < RedmineSlack::UsersControllerPatch
+	SettingsController.prepend RedmineSlack::SettingsPatch unless SettingsController < RedmineSlack::SettingsPatch
 end
 Rails.application.reloader.to_prepare(&prepare_patches)
 prepare_patches.call
@@ -24,10 +31,12 @@ Redmine::Plugin.register :redmine_slack do
 	version '0.1'
 
 	requires_redmine :version_or_higher => '7.0.0'
+	requires_redmine_plugin :'00_gorbunovstudio_background_jobs', :version_or_higher => '1.1.0'
 
 	settings \
 		:default => {
 			'delivery_enabled' => '0',
+			'bot_token' => '',
 			'callback_url' => 'http://slack.com/callback/',
 			'channel' => nil,
 			'icon' => 'https://raw.github.com/sciyoshi/redmine-slack/gh-pages/icon.png',
@@ -36,3 +45,5 @@ Redmine::Plugin.register :redmine_slack do
 		},
 		:partial => 'settings/slack_settings'
 end
+
+GorbunovStudioBackgroundJobs.dedicated_queue :slack, threads: 1
