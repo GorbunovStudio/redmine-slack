@@ -55,7 +55,7 @@ current Redmine email. Legacy preference values remain unchanged.
 ## Slack event import
 
 For inbound use, configure the Events API request URL as
-`https://redmine.optimuspro.ru/redmine_slack/events`. Enter the app signing secret
+`https://redmine.gorbunov.studio/redmine_slack/events`. Enter the app signing secret
 in **Slack signing secret** before Slack verifies the URL; the empty field
 preserves the existing secret and its status shows whether one is configured.
 Subscribe to bot events `message.groups` and `message.im`, add bot scopes
