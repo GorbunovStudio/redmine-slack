@@ -50,7 +50,7 @@ Imported notes SHALL render the message's `rich_text` blocks in order, ignoring 
 #### Scenario: Entities, links, mentions, and channels
 - **WHEN** no rich-text block exists and Slack text contains `<@U…>`, `<url|label>`, `<url>`, `<#C…|name>`, and broadcast controls alongside encoded entities
 - **THEN** the note retains the existing first-marker removal, linked-user or display-name mention resolution, labeled-link conversion, bare wrapped HTTP/HTTPS URL conversion, named-channel conversion, and broadcast conversion
-- **AND** `&amp;` is decoded, while `&lt;` and `&gt;` stay encoded rather than becoming raw HTML
+- **AND** `&amp;` is decoded, while `&lt;` and `&gt;` stay encoded rather than becoming raw HTML, except that line-start `&gt;` is converted to a quote marker
 - **AND** unrelated emphasis, code, and other Slack formatting remains as written, without the rich-text escaping or broad formatting translation
 
 #### Scenario: Text fallback corrects the measured token cases

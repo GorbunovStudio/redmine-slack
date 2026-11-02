@@ -22,7 +22,7 @@ module RedmineSlack
         author = @import_user
         author_name = @resolver.display_name(event['user'])
       end
-      text = InboundMessage.new(event['text']).convert(@resolver).strip
+      text = InboundMessage.new(event['text'], event['blocks']).convert(@resolver).strip
       notes = author_name ? ["**#{author_name}** (Slack):", text.presence].compact.join("\n") : text
       previous_user = User.current
       User.current = author
@@ -59,7 +59,7 @@ module RedmineSlack
         next unless BigDecimal(timestamp) > BigDecimal(link.last_edited_ts.to_s)
         journal = Journal.find_by(id: link.journal_id)
         next unless journal
-        text = InboundMessage.new(message['text']).convert(@resolver).strip
+        text = InboundMessage.new(message['text'], message['blocks']).convert(@resolver).strip
         notes = link.author_name.present? ? ["**#{link.author_name}** (Slack):", text.presence].compact.join("\n") : text
         journal.update!(notes: notes)
         link.update!(last_edited_ts: timestamp)

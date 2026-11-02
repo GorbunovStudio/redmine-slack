@@ -205,6 +205,23 @@ end
 class SlackWorkflowSmokeTest < ActionController::TestCase
   tests IssuesController
 
+  def html(text)
+    assert Redmine::WikiFormatting::CommonMark::PIPELINE_CONFIG[:commonmarker_render_options][:hardbreaks]
+    Redmine::WikiFormatting::CommonMark::Formatter.new(text).to_html
+  end
+
+  def rich_section(*elements)
+    {'type' => 'rich_text_section', 'elements' => elements}
+  end
+
+  def rich_text(text, style = nil)
+    {'type' => 'text', 'text' => text, 'style' => style}
+  end
+
+  def rich_blocks(*elements)
+    [{'type' => 'rich_text', 'elements' => elements}]
+  end
+
   setup do
     raise 'Run only against the upgraded local db service' unless ActiveRecord::Base.connection_db_config.host == 'db'
     raise 'Local Slack delivery must start disabled in plugin settings' if Setting.plugin_redmine_slack.with_indifferent_access[:delivery_enabled] == '1'
@@ -378,6 +395,92 @@ class SlackMemberSmokeTest < SlackWorkflowSmokeTest
 end
 
 class SlackInboundMessageSmokeTest < SlackWorkflowSmokeTest
+  def test_rich_text_uses_blocks_but_references_use_text
+    section = ->(text) { {'type' => 'rich_text_section', 'elements' => [{'type' => 'text', 'text' => text}]} }
+    blocks = [{'type' => 'header', 'text' => 'ignored'}, {'type' => 'rich_text', 'elements' => [section.call('first')]},
+      {'type' => 'rich_text', 'elements' => [section.call('second')]}]
+    message = RedmineSlack::InboundMessage.new('#12+= #34', blocks)
+    assert_equal 12, message.marker
+    assert_equal [12, 34], message.references
+    assert_equal [34], message.preview_references
+    assert_equal "<p>first</p>\n<p>second</p>", html(message.convert(Object.new))
+  end
+
+  def test_rich_text_literal_and_styles
+    elements = [
+      {'type' => 'text', 'text' => ' bold ', 'style' => {'bold' => true}},
+      {'type' => 'text', 'text' => 'italic', 'style' => {'italic' => true}},
+      {'type' => 'text', 'text' => 'strike', 'style' => {'strike' => true}},
+      {'type' => 'text', 'text' => 'a`b', 'style' => {'code' => true}},
+      {'type' => 'text', 'text' => "\n# TODO later\ntext\n---\n__init__ 2*3*4 <div> &amp;\n- item\n1. item\na | b\n#123 @login /path file.txt"}
+    ]
+    blocks = [{'type' => 'rich_text', 'elements' => [{'type' => 'rich_text_section', 'elements' => elements}]}]
+    source = RedmineSlack::InboundMessage.new('', blocks).convert(Object.new)
+    assert_includes source, '#123 @login /path file.txt'
+    result = html(source)
+    ['<strong>bold</strong>', '<em>italic</em>', '<del>strike</del>', '<code>a`b</code>'].each { |value| assert_includes result, value }
+    text = Nokogiri::HTML.fragment(result).text
+    ['# TODO later', '__init__ 2*3*4 <div> &amp;', '- item', '1. item', 'a | b', '#123 @login /path file.txt'].each { |value| assert_includes text, value }
+    refute_match(/<h[12]>|<ul>|<ol>|<table>|<div>/, result)
+    assert_match(/<strong>bold<\/strong> <em>italic<\/em>/, result)
+    assert_includes Nokogiri::HTML.fragment(result).text, "text\n---"
+  end
+
+  def test_rich_text_inline_mappings
+    resolver = Object.new
+    linked = @user
+    resolver.define_singleton_method(:user) { |id| id == 'ULINKED' ? linked : nil }
+    resolver.define_singleton_method(:display_name) { |_| 'Slack *Name*' }
+    elements = [
+      {'type' => 'link', 'url' => 'mailto:a@b.com', 'text' => 'mail [me]', 'style' => {'bold' => true}},
+      rich_text(' '), {'type' => 'link', 'url' => 'https://github.com/a_b/c_d*e'}, rich_text(' '),
+      {'type' => 'link', 'url' => 'https://example.invalid/space here'}, rich_text(' '),
+      {'type' => 'link', 'url' => 'https://example.invalid/a (b)', 'text' => 'spaced'}, rich_text(' '),
+      {'type' => 'user', 'user_id' => 'ULINKED'}, rich_text(' '), {'type' => 'user', 'user_id' => 'UOTHER'}, rich_text(' '),
+      *%w[C1 C2 C3].flat_map { |id| [{'type' => 'channel', 'channel_id' => id}, rich_text(' ')] },
+      *%w[S1 S2 S3].flat_map { |id| [{'type' => 'usergroup', 'usergroup_id' => id}, rich_text(' ')] },
+      *%w[here channel everyone].flat_map { |range| [{'type' => 'broadcast', 'range' => range}, rich_text(' ')] },
+      {'type' => 'emoji', 'name' => 'tada', 'unicode' => '1f389'}, rich_text(' '),
+      {'type' => 'emoji', 'name' => 'custom'}, rich_text(' '), {'type' => 'date', 'fallback' => 'Nov 14'}, rich_text(' '),
+      {'type' => 'unknown', 'text' => '<literal>'}, rich_text(' '), {'type' => 'unknown', 'url' => 'https://example.invalid/other'}, {'type' => 'unknown'}
+    ]
+    message = RedmineSlack::InboundMessage.new('<#C1|general> <#C2|> <!subteam^S1|@devs> <!subteam^S2|>', rich_blocks(rich_section(*elements)))
+    fragment = Nokogiri::HTML.fragment(html(message.convert(resolver)))
+    assert_equal 'mail [me]', fragment.at_css('a[href="mailto:a@b.com"] strong').text
+    assert_equal 'https://github.com/a_b/c_d*e', fragment.at_css('a[href="https://github.com/a_b/c_d*e"]').text
+    assert_equal 'https://example.invalid/space here', fragment.at_css('a[href="https://example.invalid/space%20here"]').text
+    assert fragment.at_css('a[href="https://example.invalid/a%20(b)"]')
+    ["@#{@user.login}", 'Slack *Name*', '#general #channel #channel', '@devs @group @group', '@here @channel @everyone', '🎉 :custom: Nov 14', '<literal>', 'https://example.invalid/other'].each { |value| assert_includes fragment.text, value }
+    assert_empty SlackSmokeTransport.requests
+  end
+
+  def test_rich_text_structures_and_marker
+    section = ->(text) { rich_section(rich_text(text)) }
+    list = ->(style, indent, texts, offset = 0) { {'type' => 'rich_text_list', 'style' => style, 'indent' => indent, 'offset' => offset, 'elements' => texts.map { |text| section.call(text) }} }
+    blocks = rich_blocks(section.call("before\n"), {'type' => 'rich_text_preformatted', 'elements' => [rich_text("first\n```\n"), {'type' => 'link', 'url' => 'https://example.invalid/code'}, rich_text("\nlast")]},
+      {'type' => 'rich_text_quote', 'elements' => [rich_text("quote\nsecond")]}, section.call('after'),
+      list.call('bullet', 0, ['bullet parent']), list.call('ordered', 1, ['ordered child']),
+      list.call('ordered', 0, ['ordered parent']), list.call('bullet', 1, ['bullet child']))
+    source = RedmineSlack::InboundMessage.new('', blocks).convert(Object.new)
+    assert_match(/\Abefore\n\n`/, source)
+    fragment = Nokogiri::HTML.fragment(html(source))
+    assert_equal "first\n```\nhttps://example.invalid/code\nlast\n", fragment.at_css('pre code').text
+    assert_includes fragment.at_css('blockquote').text, 'quote'
+    assert_equal 'after', fragment.css('p').find { |p| p.text == 'after' }.text
+    assert fragment.at_css('ul > li > ol'), fragment.to_html
+    assert_equal 'ordered child', fragment.at_css('ul > li > ol > li').text
+    assert_equal 'bullet child', fragment.at_css('ol > li > ul > li').text
+    offset = Nokogiri::HTML.fragment(html(RedmineSlack::InboundMessage.new('', rich_blocks(list.call('ordered', 0, ['third', 'fourth'], 2))).convert(Object.new)))
+    assert_equal '3', offset.at_css('ol')['start']
+    assert_equal %w[third fourth], offset.css('li').map(&:text)
+    message = RedmineSlack::InboundMessage.new('#12+= #34', rich_blocks(rich_section(rich_text('#12+= first #12+=', {'bold' => true}), rich_text(' #12+='))))
+    result = Nokogiri::HTML.fragment(html(message.convert(Object.new)))
+    assert_equal 'first #12+=', result.at_css('strong').text
+    assert_equal 2, result.text.scan('#12+=').size
+    assert_equal 12, message.marker
+    assert_equal [34], message.preview_references
+  end
+
   def test_parent_lookup_and_binary_download_restrictions
     client = RedmineSlack::Client.new('fixture-token')
     SlackSmokeTransport.body = '{"ok":true,"messages":[{"ts":"123.456","text":"fixture"}]}'
@@ -410,11 +513,35 @@ class SlackInboundMessageSmokeTest < SlackWorkflowSmokeTest
     linked = @user
     resolver.define_singleton_method(:user) { |id| id == 'ULINKED' ? linked : nil }
     resolver.define_singleton_method(:display_name) { |_id| 'Slack Person' }
-    text = "#123+= &amp; &lt; &gt; <@ULINKED> <@UOTHER> <https://example.invalid|label> <https://example.invalid> <#C123|general> <!here> <!channel> <!everyone> *unchanged*\n> quoted\nnext\n> another\n\nseparated"
+    text = "#123+= &amp; &lt;div&gt; x &gt; y <@ULINKED> <@UOTHER> <https://example.invalid|label> <https://example.invalid> <#C123|general> <!here> <!channel> <!everyone> *unchanged* `code`\n\n&gt; quoted\nnext\n\n&gt;another\n\nseparated"
     converted = RedmineSlack::InboundMessage.new(text).convert(resolver)
-    assert_includes converted, "& < > @#{@user.login} Slack Person [label](https://example.invalid) https://example.invalid #general @here @channel @everyone *unchanged*"
-    assert_includes converted, "> quoted\n\nnext\n> another\n\nseparated"
-    refute_includes converted, '#123+='
+    assert_includes converted, ">another\n\nseparated"
+    assert_includes converted, 'x &gt; y'
+    fragment = Nokogiri::HTML.fragment(html(converted))
+    assert_includes fragment.text, "& <div> x > y @#{@user.login} Slack Person"
+    assert_includes fragment.text, '#general @here @channel @everyone'
+    assert_equal 'unchanged', fragment.at_css('em').text
+    assert_equal 'code', fragment.at_css('code').text
+    assert_equal 2, fragment.css('a[href="https://example.invalid"]').size
+    assert_equal %w[quoted another], fragment.css('blockquote').map { |q| q.text.strip }
+    assert fragment.css('p').any? { |p| p.text == 'next' && !p.ancestors('blockquote').any? }
+    assert fragment.css('p').any? { |p| p.text == 'separated' && !p.ancestors('blockquote').any? }
+    refute_includes fragment.text, '#123+='
+    refute fragment.at_css('div')
+  end
+
+  def test_text_fallback_measured_tokens_with_no_rich_blocks
+    resolver = Object.new
+    linked = @user
+    resolver.define_singleton_method(:user) { |_| linked }
+    text = '<mailto:a@b.com|a@b.com> <custom:abc|custom> <!date^123^format|Nov 14> <!subteam^S1|@devs> <!subteam^S2|> <!subteam^S3> <@U333|old> <#C456|> &lt;div&gt;'
+    [nil, [{'type' => 'section'}]].each do |blocks|
+      fragment = Nokogiri::HTML.fragment(html(RedmineSlack::InboundMessage.new(text, blocks).convert(resolver)))
+      assert_equal 'a@b.com', fragment.at_css('a[href="mailto:a@b.com"]').text
+      assert_equal 'custom', fragment.at_css('a[href="custom:abc"]').text
+      ['Nov 14', '@devs @group @group', "@#{@user.login}", '#channel', '<div>'].each { |value| assert_includes fragment.text, value }
+      refute fragment.at_css('div')
+    end
   end
 
   def test_message_link_allows_a_journalless_tombstone
@@ -462,6 +589,36 @@ class SlackEventJobSmokeTest < SlackWorkflowSmokeTest
     yield
   ensure
     Issue.singleton_class.remove_method(:find_by)
+  end
+
+  def test_rich_text_create_edit_attribution_routing_and_previews
+    @user.define_singleton_method(:member_of?) { |_project| true }
+    other = Issue.where.not(id: @issue.id).first!
+    SlackSmokeTransport.body = '{"ok":true,"user":{"profile":{"display_name":"Outside Person"}}}'
+    created = rich_blocks(rich_section(rich_text("##{@issue.id}+= create "), rich_text('bold', {'bold' => true})))
+    event = @event.merge('ts' => '181.001', 'user' => 'UOUTSIDE', 'text' => "##{@issue.id}+= text only ##{other.id}", 'blocks' => created)
+    RedmineSlack::EventJob.perform_now(event)
+    link = RedmineSlack::MessageLink.find_by!(message_ts: '181.001')
+    journal = Journal.find(link.journal_id)
+    assert_equal @issue.id, journal.journalized_id
+    assert_equal @user.id, journal.user_id
+    fragment = Nokogiri::HTML.fragment(html(journal.notes))
+    assert_equal 'Outside Person', fragment.css('strong').first.text
+    assert_equal 'bold', fragment.css('strong').last.text
+    assert_includes fragment.text, 'create bold'
+    refute_includes fragment.text, 'text only'
+    preview = SlackSmokeTransport.requests.find { |r| r[:url].end_with?('/chat.postMessage') }
+    assert_includes JSON.parse(preview[:body])['attachments'].first['text'], "/issues/#{other.id}"
+    edit_blocks = rich_blocks(rich_section(rich_text('edit '), rich_text('italic', {'italic' => true})))
+    changed = @event.merge('subtype' => 'message_changed', 'blocks' => rich_blocks(rich_section(rich_text('wrong top-level'))),
+      'message' => {'ts' => event['ts'], 'text' => '#999999+= wrong text', 'blocks' => edit_blocks, 'edited' => {'ts' => '181.002'}})
+    RedmineSlack::EventJob.perform_now(changed)
+    fragment = Nokogiri::HTML.fragment(html(journal.reload.notes))
+    assert_equal 'Outside Person', fragment.at_css('strong').text
+    assert_equal 'italic', fragment.at_css('em').text
+    assert_includes fragment.text, 'edit italic'
+    refute_includes fragment.text, 'wrong'
+    assert_equal [@issue.id, @user.id, '181.002'], [journal.journalized_id, journal.user_id, link.reload.last_edited_ts]
   end
 
   def test_previews_run_independently_of_outbound_delivery
