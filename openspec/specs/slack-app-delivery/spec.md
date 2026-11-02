@@ -118,18 +118,27 @@ Any response outside success, rate limits, transient failures, and the defined i
 - **THEN** retry/drop diagnostics expose only a safe local classification, not that exception message
 
 ### Requirement: Documented app prerequisites and gated rollout
-The README SHALL document the required app scopes, Messages Tab, private-channel invitations, token setting, conversion task, background-jobs prerequisite, comment image delivery, and approval-gated live verification. Development verification MUST use stubbed HTTP and MUST NOT send live Slack messages.
+The README SHALL document the required app scopes, Messages Tab, private-channel invitations, token setting, conversion task, background-jobs prerequisite, comment image delivery, and approval-gated live verification. It MUST also document inbound event setup, import-user permissions, plugin migrations, and Hubot cutover. Development verification MUST use stubbed HTTP and MUST NOT send live Slack messages.
 
 #### Scenario: Operator follows the rollout documentation
 - **WHEN** an operator prepares to enable the integration
 - **THEN** the documented sequence is create/install the app, enable Messages Tab, invite the bot, configure the disabled integration, dry run, convert, perform a separately approved live test, then enable ordinary delivery
 - **AND** it lists `files:write`, `chat:write`, `chat:write.customize`, `users:read.email`, `im:write`, and conversion-only `groups:read`, without requiring `chat:write.public`
-- **AND** it states that replies can remain disabled and local/maintenance copies must retain delivery off
+- **AND** it states that replies can remain disabled for outbound-only use, distinguishes inbound app-DM use, and requires local/maintenance copies to retain delivery off
 
 #### Scenario: Existing installation prepares for image delivery
 - **WHEN** an operator reads the comment image instructions
 - **THEN** the README states that `files:write` is required and scope changes require app reinstallation
 - **AND** a short paragraph describes same-journal and inline image attachments, markup stripped only in the Slack copy, missing images skipped at delivery, and possible duplication on retry
+
+#### Scenario: Operator enables inbound processing
+- **WHEN** an operator follows the inbound setup instructions
+- **THEN** the README supplies the public HTTPS event request URL and challenge/signing-secret setup, subscriptions `message.groups` and `message.im`, and added bot scopes `groups:history`, `im:history`, `files:read`, and `users:read`, with app reinstallation
+- **AND** it explains `signing_secret`, `import_enabled` defaulting off, and `import_user_id`, including creation of an active import user and project membership with view-issues/add-notes permissions and attachment access where needed
+- **AND** it explains that the new link table requires plugin migrations and scopes processing to private channels and the app's DMs, not public channels, group DMs, or person-to-person DMs
+- **AND** enabling import is paired with disabling Hubot's preview, thread, and `#N+=` listeners while leaving its other commands and scheduled reports on Hubot
+
+Source for the inbound additions: [approved requirements](/home/andre/projects/redmine/tickets/slack-comment-import/requirements.md), ingress and rollout decisions; existing outbound setup remains governed by the main capability.
 
 ### Requirement: Comment images share the rendered comment message
 A comment with deliverable images SHALL use Slack external upload and combined completion with `channel_id`, uploaded file IDs, rendered text as `initial_comment`, and username/icon customization. The message SHALL contain the comment and images together, without a separate text post or link previews. Completion `ok: true` SHALL mean success. Unsupported `unfurl_*` parameters MUST NOT be sent to completion.
