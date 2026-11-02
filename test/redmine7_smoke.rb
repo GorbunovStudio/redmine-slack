@@ -824,6 +824,8 @@ class SlackDeliverySmokeTest < SlackWorkflowSmokeTest
     assert_equal 'fixture-bot', payload['username']
     assert_equal [{'text' => 'attachment'}], payload['attachments']
     refute payload.key?('link_names')
+    assert_equal false, payload['unfurl_links']
+    assert_equal false, payload['unfurl_media']
   end
 
   def test_comment_payload_escapes_literal_controls_but_resolves_login

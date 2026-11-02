@@ -35,7 +35,7 @@ module RedmineSlack
         destination['id']
       end
       return if channel.blank?
-      payload = {'channel' => channel, 'text' => ::RedmineSlack::MessageTemplate.render(envelope['text_parts'], resolver)}
+      payload = {'channel' => channel, 'text' => ::RedmineSlack::MessageTemplate.render(envelope['text_parts'], resolver), 'unfurl_links' => false, 'unfurl_media' => false}
       %w[attachments username icon_url icon_emoji].each do |key|
         payload[key] = envelope[key] if envelope.key?(key)
       end
