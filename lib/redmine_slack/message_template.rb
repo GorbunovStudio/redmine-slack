@@ -1,5 +1,9 @@
 module RedmineSlack
   module MessageTemplate
+    def self.escape(value)
+      value.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
+    end
+
     def self.mention(user)
       {'redmine_user_id' => user.id, 'fallback' => user.name}
     end

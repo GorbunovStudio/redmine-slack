@@ -792,7 +792,7 @@ private
     end
 
     def escape(msg)
-        msg.to_s.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;")
+        ::RedmineSlack::MessageTemplate.escape(msg)
     end
 
     def object_url(obj)

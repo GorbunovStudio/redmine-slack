@@ -4,14 +4,16 @@ Rails.autoloaders.main.ignore(File.join(__dir__, 'lib'))
 require_relative 'lib/redmine_slack/view_hooks'
 require_relative 'lib/redmine_slack/client'
 require_relative 'lib/redmine_slack/message_template'
+require_relative 'lib/redmine_slack/inbound_message'
 require_relative 'lib/redmine_slack/member_resolver'
+require_relative 'lib/redmine_slack/comment_importer'
 require_relative 'lib/redmine_slack/listener'
 require_relative 'lib/redmine_slack_user_patch'
 require_relative 'lib/redmine_slack_my_controller_patch'
 require_relative 'lib/redmine_slack_users_controller_patch'
 require_relative 'lib/redmine_slack_settings_patch'
 
-Rails.application.config.filter_parameters += [:bot_token]
+Rails.application.config.filter_parameters += [:bot_token, :signing_secret, :event]
 
 prepare_patches = proc do
 	User.include RedmineSlack::UserPatch unless User < RedmineSlack::UserPatch
@@ -36,6 +38,9 @@ Redmine::Plugin.register :redmine_slack do
 	settings \
 		:default => {
 			'delivery_enabled' => '0',
+			'import_enabled' => '0',
+			'import_user_id' => '',
+			'signing_secret' => '',
 			'bot_token' => '',
 			'callback_url' => 'http://slack.com/callback/',
 			'channel' => nil,

@@ -3,8 +3,8 @@ module RedmineSlack
     def plugin
       if request.post? && params[:id] == 'redmine_slack'
         params[:settings] ||= ActionController::Parameters.new
-        if params[:settings]['bot_token'].blank?
-          params[:settings]['bot_token'] = Setting.plugin_redmine_slack['bot_token']
+        %w[bot_token signing_secret].each do |key|
+          params[:settings][key] = Setting.plugin_redmine_slack[key] if params[:settings][key].blank?
         end
       end
       super
