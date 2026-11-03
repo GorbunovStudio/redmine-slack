@@ -32,11 +32,19 @@ module RedmineSlack
         journal = issue.init_journal(author, notes)
         if issue.attachments_addable?(author)
           Array(event['files']).each do |file|
-            bytes = @client.download_file(file)
-            next unless bytes
+            file = resolve_file(file)
+            bytes = file && @client.download_file(file)
+            unless bytes
+              Rails.logger.warn('Slack import file skipped (unavailable)')
+              next
+            end
             attachment = Attachment.new(author: author, filename: file['name'], content_type: file['mimetype'])
             attachment.file = bytes
-            issue.attachments << attachment if attachment.save
+            if attachment.save
+              issue.attachments << attachment
+            else
+              Rails.logger.warn('Slack import file skipped (rejected)')
+            end
           end
         end
         issue.save!
@@ -86,6 +94,14 @@ module RedmineSlack
     end
 
     private
+
+    # Slack can send a file placeholder without metadata or URLs; files.info returns the full file.
+    def resolve_file(file)
+      return file unless file['file_access'] == 'check_file_info'
+      @client.file_info(file['id'])
+    rescue DropError
+      nil
+    end
 
     def attributed_notes(author_name, text)
       author_name.present? ? ["**#{author_name}** (Slack):", text.presence].compact.join("\n\n") : text

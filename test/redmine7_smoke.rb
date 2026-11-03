@@ -30,7 +30,7 @@ module SlackSmokeTransport
   end
 
   def capture(method, url, body, headers)
-    allowed = {'GET' => %w[users.lookupByEmail users.info conversations.list conversations.history], 'POST' => %w[conversations.open chat.postMessage files.getUploadURLExternal files.completeUploadExternal]}
+    allowed = {'GET' => %w[users.lookupByEmail users.info conversations.list conversations.history files.info], 'POST' => %w[conversations.open chat.postMessage files.getUploadURLExternal files.completeUploadExternal]}
     endpoint = url.to_s.split('?').first
     synthetic_upload = method == 'POST' && url.to_s == 'https://upload.example.invalid/synthetic'
     synthetic_file = method == 'GET' && url.to_s == 'https://files.slack.com/synthetic-file'
@@ -983,6 +983,23 @@ class SlackEventJobSmokeTest < SlackWorkflowSmokeTest
     assert fallback.notify?
     refute_includes fallback.notes, '[silent-update]'
     assert_empty ActiveJob::Base.queue_adapter.enqueued_jobs.select { |job| job[:job] == RedmineSlack::DeliveryJob }
+  ensure
+    cleanup_import_fixture_files
+  end
+
+  def test_file_placeholders_are_resolved_with_files_info
+    @user.rslack_preference[:username] = 'ULINKED01'
+    placeholders = %w[F0RESOLVED F0MISSING].map { |id| {'id' => id, 'file_access' => 'check_file_info', 'created' => 0, 'user' => ''} }
+    info = {'ok' => true, 'file' => {'id' => 'F0RESOLVED', 'name' => 'slack-import-fixture-placeholder.png', 'mimetype' => 'image/png', 'size' => 2, 'url_private_download' => 'https://files.slack.com/synthetic-file'}}
+    SlackSmokeTransport.responses = [[200, JSON.generate(info), {}], [200, "\x89P".b, {}], [200, '{"ok":false,"error":"file_not_found"}', {}]]
+    event = @event.merge('subtype' => 'file_share', 'ts' => '152.001', 'user' => 'ULINKED01', 'text' => "##{@issue.id}+= see image", 'files' => placeholders)
+    RedmineSlack::EventJob.perform_now(event)
+    lookups = SlackSmokeTransport.requests.select { |request| request[:url] == 'https://slack.com/api/files.info' }
+    assert_equal [{file: 'F0RESOLVED'}, {file: 'F0MISSING'}], lookups.map { |request| request[:body] }
+    journal = Journal.find(RedmineSlack::MessageLink.find_by!(message_ts: '152.001').journal_id)
+    assert_equal 'see image', journal.notes
+    attachment = Attachment.find(journal.details.find_by!(property: 'attachment').prop_key)
+    assert_equal ['slack-import-fixture-placeholder.png', "\x89P".b], [attachment.filename, File.binread(attachment.diskfile)]
   ensure
     cleanup_import_fixture_files
   end

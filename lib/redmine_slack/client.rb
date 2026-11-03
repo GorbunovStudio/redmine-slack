@@ -41,6 +41,10 @@ module RedmineSlack
       Array(result['messages']).find { |message| message['ts'] == timestamp }
     end
 
+    def file_info(file_id)
+      request(:get, 'files.info', file: file_id)['file']
+    end
+
     def download_file(file)
       return nil if file['size'].to_i > Setting.attachment_max_size.to_i.kilobytes
       url = file['url_private_download'].presence || file['url_private']

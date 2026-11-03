@@ -158,6 +158,12 @@ Every file on the new message SHALL be eligible, not only images. Downloads MUST
 - **THEN** the private URL is used
 - **AND** a non-HTTPS URL or another host is not fetched or sent the token
 
+#### Scenario: Slack sends a file placeholder
+- **WHEN** a file object has `file_access` `check_file_info` instead of its metadata and URLs
+- **THEN** the full file object is fetched with `files.info` and imported like any other file
+- **AND** a permanent `files.info` error skips only that file, while the comment and other files are saved
+- **AND** every skipped file is logged with a safe reason code and no message content
+
 ### Requirement: Precheck reported file size and retain binary bytes in memory
 The integration SHALL skip a file before downloading when Slack-reported `size` exceeds the current Redmine attachment-size limit in kilobytes. Remaining downloads MUST be held in memory as binary bytes; Redmine MUST still validate the actual downloaded size and extension.
 
