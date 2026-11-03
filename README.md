@@ -61,7 +61,10 @@ preserves the existing secret and its status shows whether one is configured.
 Subscribe to bot events `message.groups` and `message.im`, add bot scopes
 `groups:history`, `im:history`, `files:read`, and `users:read`, and reinstall the
 app. Processing covers private channels containing the app and app DMs, not
-public channels, group DMs, or person-to-person DMs.
+public channels, group DMs, or person-to-person DMs. When Slack sends a file
+placeholder (`file_access: check_file_info`), the import fetches the file with
+`files.info`; files that still cannot be imported are skipped and logged as
+`Slack import file skipped (...)`.
 
 Create an active Redmine user for Slack imports and select it as **Slack import
 user**. Add it to each relevant project with permission to view issues and add
