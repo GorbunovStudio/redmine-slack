@@ -60,12 +60,26 @@ A linked user SHALL author the journal only if the issue is visible to them and 
 - **THEN** no comment or files are saved and only a safe skip reason is logged
 
 ### Requirement: Convert Slack text to CommonMark narrowly
-Imported notes SHALL render the message's `rich_text` blocks in order, ignoring other block types, and use text conversion only when no `rich_text` block exists. New imports MUST use `event.blocks`; edits MUST use `event.message.blocks`. Literal content and explicit rich-text formatting MUST follow the scenarios below. Routing, routing markers, and previews MUST continue to use the unchanged message `text`.
+Imported notes SHALL render the message's `rich_text` and `table` blocks in order, ignoring other block types, and use text conversion only when neither exists. New imports MUST use `event.blocks`; edits MUST use `event.message.blocks`. Literal content and explicit rich-text formatting MUST follow the scenarios below. Routing, routing markers, and previews MUST continue to use the unchanged message `text`.
 
 #### Scenario: Rich text is the note source, not the routing source
 - **WHEN** an eligible message has `rich_text` blocks alongside other block types and its `text` differs from their content
-- **THEN** only the rich-text blocks supply the note body, while routing and previews still inspect the original `text`
+- **THEN** only the rich-text and table blocks supply the note body, while routing and previews still inspect the original `text`
 - **AND** other block types contribute no note content and do not trigger text fallback
+
+#### Scenario: Table blocks become CommonMark tables
+- **WHEN** a message has a `table` block, alone or between `rich_text` blocks
+- **THEN** it renders in block order as a pipe table whose first row is the header, separated from neighboring blocks by a blank line, and it does not trigger text fallback
+- **AND** a `column_settings` `align` of `center` or `right` sets that column's alignment, while a missing, null, or other setting keeps the default
+- **AND** `raw_text` cells, `raw_number` cells (using `text`, otherwise `value`), and `rich_text` cells follow the same escaping and style rules as other rich text, with pipes backslash-escaped, line breaks inside a cell written as `<br>`, and rows shorter than the widest row padded with empty cells
+- **AND** Redmine's rendered HTML shows a table with the header cells in `th`, the other rows in `td`, cell content literal, and the message's other blocks before and after it
+- **AND** a table with no cells contributes no content
+
+#### Scenario: Unsupported types are logged by name
+- **WHEN** rendering a message with `rich_text` or `table` blocks skips or only approximates content, such as another top-level block type, an unknown block-level rich-text element, an inline element handled by the generic `text`/`url` fallback, or a table cell that is not `raw_text`, `raw_number`, or `rich_text`
+- **THEN** a new import or an edit logs one warning, `Slack import rendered unsupported types (a, b)`, listing each type once in alphabetical order
+- **AND** a type name that is not lowercase letters, digits, and underscores up to 40 characters is logged as `unknown`, and message content is never logged
+- **AND** a message that renders fully, or that uses text conversion because it has no `rich_text` or `table` block, logs nothing and imports exactly as before
 
 #### Scenario: Literal text cannot invent CommonMark structure
 - **WHEN** a rich-text text element contains characters meaningful to CommonMark

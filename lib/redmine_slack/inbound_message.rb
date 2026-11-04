@@ -34,9 +34,18 @@ module RedmineSlack
       references - excluded
     end
 
+    def unsupported_types
+      @unsupported_types || []
+    end
+
     def convert(resolver)
-      rich = @blocks.select { |block| block['type'] == 'rich_text' }
-      return RichTextRenderer.new(@text, resolver).render(rich) if rich.any?
+      rich = @blocks.select { |block| %w[rich_text table].include?(block['type']) }
+      if rich.any?
+        renderer = RichTextRenderer.new(@text, resolver)
+        rendered = renderer.render(rich)
+        @unsupported_types = (@blocks - rich).map { |block| block['type'] }.concat(renderer.unsupported).map { |type| safe_type(type) }.uniq.sort
+        return rendered
+      end
 
       text = without_marker.gsub(/<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/) do
         member = Regexp.last_match(1)
@@ -54,16 +63,24 @@ module RedmineSlack
       text.gsub(/(^>[^\n]*\n)(?=[^>\n])/, "\\1\n")
     end
 
+    def safe_type(type)
+      type.to_s.match?(/\A[a-z0-9_]{1,40}\z/) ? type.to_s : 'unknown'
+    end
+    private :safe_type
+
     class RichTextRenderer
+      attr_reader :unsupported
+
       def initialize(text, resolver)
         @text = text
         @resolver = resolver
         @marker = text[MARKER]
+        @unsupported = []
       end
 
       def render(blocks)
         previous = nil
-        blocks.flat_map { |block| Array(block['elements']) }.map do |element|
+        blocks.flat_map { |block| block['type'] == 'table' ? [block] : Array(block['elements']) }.map do |element|
           type = element['type']
           separator = previous == 'rich_text_list' && type == previous ? "\n" : "\n\n"
           separator = '' unless previous
@@ -128,6 +145,7 @@ module RedmineSlack
         when 'date'
           literal(element['fallback'])
         else
+          @unsupported << type
           literal(element['text'] || element['url'])
         end
       end
@@ -181,9 +199,38 @@ module RedmineSlack
             lines = structure(item).split("\n", -1)
             indentation + prefix + lines.first.to_s + lines.drop(1).map { |line| line.empty? ? "\n" : "\n#{indentation}#{' ' * prefix.length}#{line}" }.join
           end.join("\n")
+        when 'table'
+          table(element)
         else
+          @unsupported << element['type']
           ''
         end
+      end
+
+      def table(block)
+        rows = Array(block['rows']).map { |row| Array(row).map { |cell| table_cell(cell) } }
+        width = rows.map(&:length).max.to_i
+        return '' if width.zero?
+
+        settings = Array(block['column_settings'])
+        alignments = Array.new(width) do |index|
+          align = settings[index].is_a?(Hash) ? settings[index]['align'] : nil
+          {'center' => ':---:', 'right' => '---:'}.fetch(align, '---')
+        end
+        lines = rows.map { |row| "| #{(row + [''] * (width - row.length)).join(' | ')} |" }
+        lines.insert(1, "| #{alignments.join(' | ')} |")
+        lines.join("\n")
+      end
+
+      def table_cell(cell)
+        cell = {} unless cell.is_a?(Hash)
+        text = if cell['type'] == 'rich_text'
+          Array(cell['elements']).map { |element| structure(element) }.join("\n")
+        else
+          @unsupported << cell['type'] unless %w[raw_text raw_number].include?(cell['type']) || cell.empty?
+          literal(consume_marker((cell['text'] || cell['value']).to_s))
+        end
+        text.strip.gsub(/\s*\n\s*/, '<br>').gsub(/(?<!\\)\|/) { '\\|' }
       end
     end
   end
