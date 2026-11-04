@@ -35,7 +35,7 @@ module RedmineSlack
     end
 
     def convert(resolver)
-      rich = @blocks.select { |block| block['type'] == 'rich_text' }
+      rich = @blocks.select { |block| %w[rich_text table].include?(block['type']) }
       return RichTextRenderer.new(@text, resolver).render(rich) if rich.any?
 
       text = without_marker.gsub(/<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/) do
@@ -63,7 +63,7 @@ module RedmineSlack
 
       def render(blocks)
         previous = nil
-        blocks.flat_map { |block| Array(block['elements']) }.map do |element|
+        blocks.flat_map { |block| block['type'] == 'table' ? [block] : Array(block['elements']) }.map do |element|
           type = element['type']
           separator = previous == 'rich_text_list' && type == previous ? "\n" : "\n\n"
           separator = '' unless previous
@@ -181,9 +181,36 @@ module RedmineSlack
             lines = structure(item).split("\n", -1)
             indentation + prefix + lines.first.to_s + lines.drop(1).map { |line| line.empty? ? "\n" : "\n#{indentation}#{' ' * prefix.length}#{line}" }.join
           end.join("\n")
+        when 'table'
+          table(element)
         else
           ''
         end
+      end
+
+      def table(block)
+        rows = Array(block['rows']).map { |row| Array(row).map { |cell| table_cell(cell) } }
+        width = rows.map(&:length).max.to_i
+        return '' if width.zero?
+
+        settings = Array(block['column_settings'])
+        alignments = Array.new(width) do |index|
+          align = settings[index].is_a?(Hash) ? settings[index]['align'] : nil
+          {'center' => ':---:', 'right' => '---:'}.fetch(align, '---')
+        end
+        lines = rows.map { |row| "| #{(row + [''] * (width - row.length)).join(' | ')} |" }
+        lines.insert(1, "| #{alignments.join(' | ')} |")
+        lines.join("\n")
+      end
+
+      def table_cell(cell)
+        cell = {} unless cell.is_a?(Hash)
+        text = if cell['type'] == 'rich_text'
+          Array(cell['elements']).map { |element| structure(element) }.join("\n")
+        else
+          literal(consume_marker((cell['text'] || cell['value']).to_s))
+        end
+        text.strip.gsub(/\s*\n\s*/, '<br>').gsub(/(?<!\\)\|/) { '\\|' }
       end
     end
   end

@@ -508,6 +508,65 @@ class SlackInboundMessageSmokeTest < SlackWorkflowSmokeTest
     assert_equal [34], message.preview_references
   end
 
+  def slack_table(rows, column_settings = nil)
+    block = {'type' => 'table', 'rows' => rows}
+    block['column_settings'] = column_settings if column_settings
+    block
+  end
+
+  def rich_cell(*elements)
+    {'type' => 'rich_text', 'elements' => [rich_section(*elements)]}
+  end
+
+  def raw_cell(text)
+    {'type' => 'raw_text', 'text' => text}
+  end
+
+  def test_table_block_renders_between_rich_text_blocks
+    table = slack_table([
+      [rich_cell(rich_text('Hospital', {'bold' => true})), rich_cell(rich_text('Contact Email', {'bold' => true})), raw_cell('Visits')],
+      [raw_cell('Kids | Art'), rich_cell({'type' => 'link', 'url' => 'mailto:rachel@kidsandart.org', 'text' => 'rachel@kidsandart.org'}), {'type' => 'raw_number', 'value' => 12, 'text' => '12'}],
+      [rich_cell(rich_text("Dana-Farber\n(at Harvard)")), rich_cell(rich_text('a|b', {'code' => true}))],
+      [raw_cell('# not a heading'), raw_cell('')]
+    ], [nil, {'align' => 'center'}, {'align' => 'right'}])
+    blocks = [{'type' => 'rich_text', 'elements' => [rich_section(rich_text("ok these should be them.\n"))]}, table,
+      {'type' => 'rich_text', 'elements' => [rich_section(rich_text('after'))]}]
+    source = RedmineSlack::InboundMessage.new('#12+= ok', blocks).convert(Object.new)
+    fragment = Nokogiri::HTML.fragment(html(source))
+    assert_equal %w[p table p], fragment.element_children.map(&:name), source
+    assert_equal 'ok these should be them.', fragment.element_children.first.text
+    assert_equal 'after', fragment.element_children.last.text
+    assert_equal %w[Hospital] + ['Contact Email', 'Visits'], fragment.css('thead th').map(&:text)
+    assert_equal 'Hospital', fragment.at_css('thead th strong').text
+    rows = fragment.css('tbody tr')
+    assert_equal 3, rows.size
+    assert rows.all? { |row| row.css('td').size == 3 }, fragment.to_html
+    assert_equal ['Kids | Art', 'rachel@kidsandart.org', '12'], rows[0].css('td').map(&:text)
+    assert_equal 'mailto:rachel@kidsandart.org', rows[0].at_css('a')['href']
+    assert_equal ['Dana-Farber(at Harvard)', 'a|b', ''], rows[1].css('td').map { |cell| cell.text.strip }
+    assert rows[1].at_css('td br'), fragment.to_html
+    assert_equal 'a|b', rows[1].at_css('td code').text
+    assert_equal ['# not a heading', '', ''], rows[2].css('td').map(&:text)
+    refute fragment.at_css('h1')
+    assert_match(/text-align:\s*center|align="center"/, fragment.at_css('thead th:nth-child(2)').to_html)
+    assert_match(/text-align:\s*right|align="right"/, fragment.at_css('thead th:nth-child(3)').to_html)
+    refute_match(/text-align|align=/, fragment.at_css('thead th:nth-child(1)').to_html)
+  end
+
+  def test_table_only_message_does_not_fall_back_to_text
+    table = slack_table([[raw_cell('A'), raw_cell('B')], [raw_cell('1'), raw_cell('2')]])
+    message = RedmineSlack::InboundMessage.new('#12+= fallback text', [{'type' => 'section'}, table])
+    fragment = Nokogiri::HTML.fragment(html(message.convert(Object.new)))
+    assert_equal %w[A B], fragment.css('th').map(&:text)
+    assert_equal %w[1 2], fragment.css('td').map(&:text)
+    refute_includes fragment.text, 'fallback text'
+  end
+
+  def test_empty_table_block_adds_nothing
+    blocks = [{'type' => 'rich_text', 'elements' => [rich_section(rich_text('only text'))]}, slack_table([]), slack_table([[]])]
+    assert_equal 'only text', RedmineSlack::InboundMessage.new('', blocks).convert(Object.new).strip
+  end
+
   def test_parent_lookup_and_binary_download_restrictions
     client = RedmineSlack::Client.new('fixture-token')
     SlackSmokeTransport.body = '{"ok":true,"messages":[{"ts":"123.456","text":"fixture"}]}'
