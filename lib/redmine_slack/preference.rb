@@ -17,10 +17,4 @@ module RedmineSlack
       @user.pref[:rslack_username].to_s.strip
     end
   end
-
-  module UserPatch
-    def rslack_preference
-      @rslack_preference ||= Preference.new(self)
-    end
-  end
 end
