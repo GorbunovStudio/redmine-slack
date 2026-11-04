@@ -73,10 +73,11 @@ Imported notes SHALL render the message's `rich_text` and `table` blocks in orde
 - **AND** a `column_settings` `align` of `center` or `right` sets that column's alignment, while a missing, null, or other setting keeps the default
 - **AND** `raw_text` cells, `raw_number` cells (using `text`, otherwise `value`), and `rich_text` cells follow the same escaping and style rules as other rich text, with pipes backslash-escaped, line breaks inside a cell written as `<br>`, and rows shorter than the widest row padded with empty cells
 - **AND** Redmine's rendered HTML shows a table with the header cells in `th`, the other rows in `td`, cell content literal, and the message's other blocks before and after it
+- **AND** a line break inside code-styled text in a cell renders as separate code spans around the `<br>`, so the break is not shown literally inside code
 - **AND** a table with no cells contributes no content
 
 #### Scenario: Unsupported types are logged by name
-- **WHEN** rendering a message with `rich_text` or `table` blocks skips or only approximates content, such as another top-level block type, an unknown block-level rich-text element, an inline element handled by the generic `text`/`url` fallback, or a table cell that is not `raw_text`, `raw_number`, or `rich_text`
+- **WHEN** rendering a message with `rich_text` or `table` blocks skips or only approximates content, such as another top-level block type, an unknown block-level rich-text element, an inline element handled by the generic `text`/`url` fallback, a child of a preformatted block other than `text` or `link`, or a table cell that is not `raw_text`, `raw_number`, or `rich_text`
 - **THEN** a new import or an edit logs one warning, `Slack import rendered unsupported types (a, b)`, listing each type once in alphabetical order
 - **AND** a type name that is not lowercase letters, digits, and underscores up to 40 characters is logged as `unknown`, and message content is never logged
 - **AND** a message that renders fully, or that uses text conversion because it has no `rich_text` or `table` block, logs nothing and imports exactly as before
