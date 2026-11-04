@@ -98,13 +98,19 @@ module RedmineSlack
           .gsub(/^( {0,3}\d+)([.)])(?=\s)/, '\\1\\\\\\2')
       end
 
+      def code_span(text)
+        fence = '`' * [text.scan(/`+/).map(&:length).max.to_i + 1, 1].max
+        padding = text.start_with?('`', ' ') || text.end_with?('`', ' ') ? ' ' : ''
+        "#{fence}#{padding}#{text}#{padding}#{fence}"
+      end
+
       def styled(text, style)
         style ||= {}
         return literal(text) if text.match?(/\A\s*\z/)
         if style['code']
-          fence = '`' * [text.scan(/`+/).map(&:length).max.to_i + 1, 1].max
-          padding = text.start_with?('`', ' ') || text.end_with?('`', ' ') ? ' ' : ''
-          return "#{fence}#{padding}#{text}#{padding}#{fence}"
+          return text.split(/\r?\n/, -1).map { |line| line.empty? ? line : code_span(line) }.join("\n") if @in_table_cell
+
+          return code_span(text)
         end
         leading = text[/\A\s*/]
         trailing = text[/\s*\z/]
@@ -187,7 +193,12 @@ module RedmineSlack
           end
           parts.join.sub(/\n\z/, '')
         when 'rich_text_preformatted'
-          content = elements.map { |item| item['type'] == 'text' ? consume_marker(item['text'].to_s) : (item['text'] || item['url']).to_s }.join
+          content = elements.map do |item|
+            next consume_marker(item['text'].to_s) if item['type'] == 'text'
+
+            @unsupported << item['type'] unless item['type'] == 'link'
+            (item['text'] || item['url']).to_s
+          end.join
           fence = '`' * [content.scan(/`+/).map(&:length).max.to_i + 1, 3].max
           "#{fence}\n#{content.sub(/\n\z/, '')}\n#{fence}"
         when 'rich_text_quote'
@@ -225,7 +236,12 @@ module RedmineSlack
       def table_cell(cell)
         cell = {} unless cell.is_a?(Hash)
         text = if cell['type'] == 'rich_text'
-          Array(cell['elements']).map { |element| structure(element) }.join("\n")
+          @in_table_cell = true
+          begin
+            Array(cell['elements']).map { |element| structure(element) }.join("\n")
+          ensure
+            @in_table_cell = false
+          end
         else
           @unsupported << cell['type'] unless %w[raw_text raw_number].include?(cell['type']) || cell.empty?
           literal(consume_marker((cell['text'] || cell['value']).to_s))

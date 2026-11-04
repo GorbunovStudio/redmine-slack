@@ -567,6 +567,25 @@ class SlackInboundMessageSmokeTest < SlackWorkflowSmokeTest
     assert_equal 'only text', RedmineSlack::InboundMessage.new('', blocks).convert(Object.new).strip
   end
 
+  def test_table_cell_code_with_line_breaks_keeps_the_breaks_outside_the_code
+    table = slack_table([[raw_cell('H')], [rich_cell(rich_text("first\n\n`second`", {'code' => true}), rich_text(' tail'))]])
+    cell = Nokogiri::HTML.fragment(html(RedmineSlack::InboundMessage.new('x', [table]).convert(Object.new))).at_css('tbody td')
+    assert_equal %w[first `second`], cell.css('code').map(&:text)
+    assert cell.at_css('br')
+    refute_includes cell.text, '<br>'
+    assert_includes cell.text, 'tail'
+    plain = Nokogiri::HTML.fragment(html(RedmineSlack::InboundMessage.new('x', rich_blocks(rich_section(rich_text("one\ntwo", {'code' => true})))).convert(Object.new)))
+    assert_equal ['one two'], plain.css('code').map(&:text)
+  end
+
+  def test_unsupported_types_inside_preformatted_blocks_are_reported
+    pre = {'type' => 'rich_text_preformatted', 'elements' => [rich_text('code '), {'type' => 'link', 'url' => 'https://example.invalid'},
+      {'type' => 'color', 'value' => '#ff0000'}, {'type' => 'emoji', 'name' => 'tada'}]}
+    message = RedmineSlack::InboundMessage.new('x', rich_blocks(pre))
+    assert_includes message.convert(Object.new), "code https://example.invalid\n"
+    assert_equal %w[color emoji], message.unsupported_types
+  end
+
   def test_unsupported_types_are_reported_by_name_only
     blocks = [{'type' => 'header', 'text' => 'secret title'},
       {'type' => 'rich_text', 'elements' => [rich_section(rich_text('secret body'), {'type' => 'color', 'value' => '#ff0000'}, {'type' => 'Bad Type!'}), {'type' => 'rich_text_extra'}]},
