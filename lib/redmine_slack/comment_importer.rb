@@ -22,7 +22,7 @@ module RedmineSlack
         author = @import_user
         author_name = @resolver.display_name(event['user'])
       end
-      text = InboundMessage.new(event['text'], event['blocks']).convert(@resolver).strip
+      text = convert(event['text'], event['blocks'])
       notes = attributed_notes(author_name, text)
       previous_user = User.current
       User.current = author
@@ -67,7 +67,7 @@ module RedmineSlack
         next unless BigDecimal(timestamp) > BigDecimal(link.last_edited_ts.to_s)
         journal = Journal.find_by(id: link.journal_id)
         next unless journal
-        text = InboundMessage.new(message['text'], message['blocks']).convert(@resolver).strip
+        text = convert(message['text'], message['blocks'])
         notes = attributed_notes(link.author_name, text)
         journal.update!(notes: notes)
         link.update!(last_edited_ts: timestamp)
@@ -94,6 +94,14 @@ module RedmineSlack
     end
 
     private
+
+    def convert(text, blocks)
+      message = InboundMessage.new(text, blocks)
+      converted = message.convert(@resolver).strip
+      types = message.unsupported_types
+      Rails.logger.warn("Slack import rendered unsupported types (#{types.join(', ')})") if types.any?
+      converted
+    end
 
     # Slack can send a file placeholder without metadata or URLs; files.info returns the full file.
     def resolve_file(file)

@@ -567,6 +567,22 @@ class SlackInboundMessageSmokeTest < SlackWorkflowSmokeTest
     assert_equal 'only text', RedmineSlack::InboundMessage.new('', blocks).convert(Object.new).strip
   end
 
+  def test_unsupported_types_are_reported_by_name_only
+    blocks = [{'type' => 'header', 'text' => 'secret title'},
+      {'type' => 'rich_text', 'elements' => [rich_section(rich_text('secret body'), {'type' => 'color', 'value' => '#ff0000'}, {'type' => 'Bad Type!'}), {'type' => 'rich_text_extra'}]},
+      slack_table([[{'type' => 'action_cell'}]])]
+    message = RedmineSlack::InboundMessage.new('x', blocks)
+    assert_empty message.unsupported_types
+    message.convert(Object.new)
+    assert_equal %w[action_cell color header rich_text_extra unknown], message.unsupported_types
+    supported = RedmineSlack::InboundMessage.new('x', rich_blocks(rich_section(rich_text('a')), {'type' => 'rich_text_quote', 'elements' => []}))
+    supported.convert(Object.new)
+    assert_empty supported.unsupported_types
+    fallback = RedmineSlack::InboundMessage.new('x', [{'type' => 'section'}])
+    fallback.convert(Object.new)
+    assert_empty fallback.unsupported_types
+  end
+
   def test_parent_lookup_and_binary_download_restrictions
     client = RedmineSlack::Client.new('fixture-token')
     SlackSmokeTransport.body = '{"ok":true,"messages":[{"ts":"123.456","text":"fixture"}]}'
@@ -708,6 +724,26 @@ class SlackEventJobSmokeTest < SlackWorkflowSmokeTest
     assert_equal 'struck history', quote.at_css('del').text
     assert quote.at_css('pre code')
     assert_equal 2, quote.css('li').size
+  end
+
+  def test_unsupported_block_types_are_logged_without_content
+    @user.rslack_preference[:username] = 'ULINKED01'
+    blocks = [{'type' => 'header', 'text' => 'secret title'}] +
+      rich_blocks(rich_section(rich_text("##{@issue.id}+= secret body"), {'type' => 'color', 'value' => '#ff0000'}))
+    event = @event.merge('ts' => '190.001', 'user' => 'ULINKED01', 'text' => "##{@issue.id}+= secret body", 'blocks' => blocks)
+    output = StringIO.new
+    previous = Rails.logger
+    Rails.logger = Logger.new(output)
+    begin
+      assert_difference 'Journal.count', 1 do
+        RedmineSlack::EventJob.perform_now(event)
+      end
+    ensure
+      Rails.logger = previous
+    end
+    assert_includes output.string, 'Slack import rendered unsupported types (color, header)'
+    refute_includes output.string, 'secret'
+    assert_includes Journal.find(RedmineSlack::MessageLink.find_by!(message_ts: event['ts']).journal_id).notes, 'secret body'
   end
 
   def test_fallback_author_offset_list_on_create_and_edit

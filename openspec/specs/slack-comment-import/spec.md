@@ -75,6 +75,12 @@ Imported notes SHALL render the message's `rich_text` and `table` blocks in orde
 - **AND** Redmine's rendered HTML shows a table with the header cells in `th`, the other rows in `td`, cell content literal, and the message's other blocks before and after it
 - **AND** a table with no cells contributes no content
 
+#### Scenario: Unsupported types are logged by name
+- **WHEN** rendering a message with `rich_text` or `table` blocks skips or only approximates content, such as another top-level block type, an unknown block-level rich-text element, an inline element handled by the generic `text`/`url` fallback, or a table cell that is not `raw_text`, `raw_number`, or `rich_text`
+- **THEN** a new import or an edit logs one warning, `Slack import rendered unsupported types (a, b)`, listing each type once in alphabetical order
+- **AND** a type name that is not lowercase letters, digits, and underscores up to 40 characters is logged as `unknown`, and message content is never logged
+- **AND** a message that renders fully, or that uses text conversion because it has no `rich_text` or `table` block, logs nothing and imports exactly as before
+
 #### Scenario: Literal text cannot invent CommonMark structure
 - **WHEN** a rich-text text element contains characters meaningful to CommonMark
 - **THEN** backslash, backtick, asterisk, underscore, tilde, square brackets, angle brackets, and pipe are backslash-escaped everywhere, and an ampersand starting an entity-like sequence is backslash-escaped
