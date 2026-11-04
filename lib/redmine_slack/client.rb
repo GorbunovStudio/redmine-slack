@@ -6,18 +6,6 @@ require 'openssl'
 require 'uri'
 
 module RedmineSlack
-  class TransientError < StandardError; end
-  class DropError < StandardError; end
-  class IdentityMiss < StandardError; end
-  class RateLimitError < StandardError
-    attr_reader :wait
-
-    def initialize(wait)
-      @wait = wait
-      super('ratelimited')
-    end
-  end
-
   class Client
     def initialize(token)
       @token = token
