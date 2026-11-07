@@ -52,6 +52,52 @@ Users or administrators can set a Slack member ID (`U…` or `W…`) in the
 existing Slack preference as an override. Otherwise delivery looks up the
 current Redmine email. Legacy preference values remain unchanged.
 
+## Profile avatars
+
+Redmine can show a Slack profile picture as the avatar fallback for a user whose
+Slack preference holds an explicit member ID (`U…` or `W…`, surrounding spaces
+ignored). Empty values, legacy names, and email-only users keep their existing
+avatars; the email lookup used for notifications is not used for avatars.
+
+- **Gravatar enabled:** a registered Gravatar always wins. The cached Slack
+  picture is passed as Gravatar's custom default image, for both the normal and the
+  2x image. Without a usable picture the configured Redmine default applies.
+- **Gravatar disabled:** the cached Slack picture is shown before initials.
+- Pages never call Slack. The first render uses the existing default and queues
+  one refresh on the `slack` queue, which calls only `users.info` for the stored
+  member ID. The picture URL, member ID, refresh deadline, and job ID are stored in
+  the user's existing Redmine preferences; no table, migration, schedule,
+  setting, or image file is added, and images are neither downloaded nor proxied.
+- A refresh is requested at most once per 24 hours, the interval already used
+  for cached member lookups, including after a failure. The cached picture keeps
+  being shown while a refresh is pending or has failed. Rate limits and transient
+  errors are retried as described under Delivery Control. Changing or clearing the
+  member ID discards the cached picture.
+- The bot needs the `users:read` scope (also used by Slack event import);
+  reinstall the app after adding scopes. Refreshing needs only the bot token and is
+  independent of **Enable Slack delivery** and **Enable Slack import**. Do not
+  enable either, or send a message, to try avatars. A missing scope is logged as
+  `Slack avatar refresh dropped (missing_scope)` and defaults stay in place.
+- Only the largest numeric `image_<size>` URL compatible with Gravatar's custom
+  default rule is used: public HTTPS on port 443, a `jpg`, `jpeg`, `gif`, `png`,
+  or `heic` extension, and no query string. URLs are never rewritten to fit.
+
+The automated tests use stubbed profile responses and parsed HTML. They do not
+prove that a real Slack picture is publicly reachable, that Gravatar accepts it as
+a default, or that a registered Gravatar keeps priority for a real account. That
+needs a separately approved check with real associated accounts, without sending
+messages, recording each outcome with no tokens or sensitive URLs:
+
+| Case | Account | Expected | Result |
+| --- | --- | --- | --- |
+| Gravatar present | registered Gravatar | Gravatar picture shown | |
+| Gravatar absent | no Gravatar | Slack picture shown | |
+| High density | no Gravatar, 2x display | Slack picture at the 2x URL | |
+| Gravatar disabled | any associated account | Slack picture before initials | |
+
+If a case fails, report the evidence and agree on a new design before changing
+the fallback mechanism.
+
 ## Slack event import
 
 For inbound use, configure the Events API request URL as
@@ -156,7 +202,8 @@ Delivery never resolves channel names at send time.
    maintenance copies, including restored databases, disabled.
 
 For rollback, first disable delivery and leave the job class available until
-queued jobs have consumed the disabled state. Keep conversion output to restore
+queued jobs have consumed the disabled state; keep the avatar refresh job class
+available until its queued jobs have run. Keep conversion output to restore
 stored channel values if an operator explicitly rolls back. Restoring `#name`
 values alone does not restore the legacy integration; do not silently re-enable
 it or delete existing preferences, custom fields, or GoodJob tables.
