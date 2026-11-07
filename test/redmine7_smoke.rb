@@ -2479,6 +2479,39 @@ class SlackAvatarCacheSmokeTest < SlackAvatarSmokeTest
     end
   end
 
+  def test_malformed_bookkeeping_with_a_future_deadline_is_uncached_but_a_valid_negative_cache_is_kept
+    future = in_24_hours + 3600
+    invalid = {
+      'non-string url' => {member_id: 'UAVATAR01', url: 5, refresh_after: future, job_id: SecureRandom.uuid},
+      'array url' => {member_id: 'UAVATAR01', url: [AVATAR_URL], refresh_after: future, job_id: SecureRandom.uuid},
+      'missing job id' => {member_id: 'UAVATAR01', url: AVATAR_URL, refresh_after: future, job_id: nil},
+      'non-string job id' => {member_id: 'UAVATAR01', url: AVATAR_URL, refresh_after: future, job_id: 7},
+      'symbol url' => {member_id: 'UAVATAR01', url: :symbol, refresh_after: future, job_id: SecureRandom.uuid},
+      'string deadline' => {member_id: 'UAVATAR01', url: AVATAR_URL, refresh_after: future.to_s, job_id: SecureRandom.uuid}
+    }
+    invalid.each do |label, state|
+      pref = UserPreference.find_by!(user_id: @subject.id)
+      pref[:rslack_avatar] = state
+      pref.save!
+      queued_jobs.clear
+      assert_nil avatar_cache.url_for(@subject), label
+      assert_equal 1, queued_jobs.length, "#{label}: a replacement refresh must be queued"
+      replacement = avatar_state(@subject)
+      assert_equal queued_jobs.first['job_id'], replacement[:job_id], label
+      assert_nil replacement[:url], label
+      assert_operator replacement[:refresh_after], :<, future, label
+    end
+
+    negative = {member_id: 'UAVATAR01', url: nil, refresh_after: future, job_id: SecureRandom.uuid}
+    pref = UserPreference.find_by!(user_id: @subject.id)
+    pref[:rslack_avatar] = negative
+    pref.save!
+    queued_jobs.clear
+    assert_nil avatar_cache.url_for(@subject)
+    assert_empty queued_jobs
+    assert_equal negative, avatar_state(@subject)
+  end
+
   def test_completion_keeps_newer_unrelated_preferences_and_current_association
     request_job
     job_id = avatar_state(@subject)[:job_id]
@@ -2581,6 +2614,70 @@ class SlackAvatarPreferenceSmokeTest < SlackAvatarSmokeTest
     assert_nil fresh[:rslack_avatar]
     refute held.pref.changed?
     assert_equal 'UAVATAR02', held.rslack_preference[:username]
+  end
+
+  def test_setter_keeps_a_new_unsaved_callers_edits_when_another_caller_created_the_row
+    defaults = UserPreference.new
+    UserPreference.where(user_id: @subject.id).delete_all
+    held = User.find(@subject.id)
+    local = held.build_preference
+    assert local.new_record?
+    local.hide_mail = !defaults.hide_mail
+    local[:default_issue_query] = '12'
+    refute_equal ['issue_assigned_to_me'], defaults.auto_watch_on
+
+    other = User.find(@subject.id)
+    saved = other.pref
+    saved.time_zone = 'Tokyo'
+    saved.no_self_notified = !defaults.no_self_notified
+    saved.auto_watch_on = ['issue_assigned_to_me']
+    saved[:textarea_font] = 'proportional'
+    saved[:comments_sorting] = 'desc'
+    saved.save!
+    other.rslack_preference[:username] = 'UAVATAR01'
+    newer = {member_id: 'UAVATAR01', url: AVATAR_URL, refresh_after: in_24_hours + 60, job_id: SecureRandom.uuid}
+    saved = UserPreference.find_by!(user_id: @subject.id)
+    saved[:rslack_avatar] = newer
+    saved.save!
+
+    held.rslack_preference[:username] = ' UAVATAR01 '
+    fresh = UserPreference.find_by!(user_id: @subject.id)
+    assert_equal 1, UserPreference.where(user_id: @subject.id).count
+    assert_equal !defaults.hide_mail, fresh.hide_mail
+    assert_equal '12', fresh[:default_issue_query]
+    assert_equal 'Tokyo', fresh.time_zone
+    assert_equal !defaults.no_self_notified, fresh.no_self_notified
+    assert_equal ['issue_assigned_to_me'], fresh.auto_watch_on
+    assert_equal 'proportional', fresh[:textarea_font]
+    assert_equal 'desc', fresh[:comments_sorting]
+    assert_equal 'UAVATAR01', fresh[:rslack_username]
+    assert_equal newer, fresh[:rslack_avatar]
+    assert_predicate held.pref, :persisted?
+    refute held.pref.changed?
+    assert_equal fresh.id, held.pref.id
+
+    held = User.find(@subject.id)
+    held.pref[:default_project_query] = '9'
+    held.rslack_preference[:username] = 'UAVATAR02'
+    fresh = UserPreference.find_by!(user_id: @subject.id)
+    assert_equal '9', fresh[:default_project_query]
+    assert_equal '12', fresh[:default_issue_query]
+    assert_equal ['issue_assigned_to_me'], fresh.auto_watch_on
+    assert_equal 'UAVATAR02', fresh[:rslack_username]
+    assert_nil fresh[:rslack_avatar]
+  end
+
+  def test_setter_for_a_new_unsaved_preference_without_edits_does_not_override_saved_settings
+    UserPreference.where(user_id: @subject.id).delete_all
+    held = User.find(@subject.id)
+    held.build_preference
+    other = User.find(@subject.id)
+    other.pref.update!(time_zone: 'Tokyo', hide_mail: !UserPreference.new.hide_mail)
+    held.rslack_preference[:username] = 'UAVATAR01'
+    fresh = UserPreference.find_by!(user_id: @subject.id)
+    assert_equal 'Tokyo', fresh.time_zone
+    assert_equal !UserPreference.new.hide_mail, fresh.hide_mail
+    assert_equal 'UAVATAR01', fresh[:rslack_username]
   end
 
   def test_first_preference_row_is_created_by_the_setter
@@ -3044,6 +3141,7 @@ end
 # everything it committed. GoodJob stays in external mode: no worker runs and nothing is sent.
 class SlackAvatarConcurrencySmokeTest < ActiveSupport::TestCase
   THREADS = 6
+  TIMEOUT = 60
 
   setup do
     raise 'Run only against the upgraded local db service' unless ActiveRecord::Base.connection_db_config.host == 'db'
@@ -3061,6 +3159,60 @@ class SlackAvatarConcurrencySmokeTest < ActiveSupport::TestCase
     end
   end
 
+  # Runs the block in `count` threads on separate connections once all are ready, and
+  # returns their database backend pids. Readiness and completion share one deadline,
+  # worker errors are re-raised here, and every thread is joined (or killed) and its
+  # connection released before this returns or raises.
+  def run_simultaneously(count, timeout: TIMEOUT, prepare: nil, &work)
+    pool = ActiveRecord::Base.connection_pool
+    available = pool.size - pool.stat[:busy]
+    raise "connection pool cannot supply #{count} worker connections (#{available} available)" if available < count
+
+    clock = -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+    deadline = clock.call + timeout
+    remaining = -> { [deadline - clock.call, 0].max }
+    barrier = Queue.new
+    ready = Queue.new
+    errors = Queue.new
+    backends = Queue.new
+    threads = Array.new(count) do |index|
+      Thread.new do
+        signaled = false
+        begin
+          Rails.application.executor.wrap do
+            pool.with_connection do |connection|
+              prepare&.call(index)
+              backends << connection.select_value('SELECT pg_backend_pid()')
+              signaled = true
+              ready << true
+              work.call(index) if barrier.pop == :go
+            end
+          end
+        rescue Exception => error # rubocop:disable Lint/RescueException
+          errors << error
+          ready << false unless signaled
+        end
+      end
+    end
+    begin
+      count.times do
+        signal = ready.pop(timeout: remaining.call)
+        raise "workers were not ready within #{timeout}s" if signal.nil?
+        raise errors.pop(true) unless signal
+      end
+      count.times { barrier << :go }
+      threads.each { |thread| raise "a worker did not finish within #{timeout}s" unless thread.join(remaining.call) }
+      raise errors.pop(true) unless errors.empty?
+      Array.new(backends.size) { backends.pop }
+    ensure
+      barrier.close
+      threads.each do |thread|
+        thread.kill if thread.alive?
+        thread.join
+      end
+    end
+  end
+
   def test_simultaneous_cold_refresh_requests_on_separate_connections_yield_one_outstanding_job
     ActiveJob::Base.queue_adapter = GoodJob::Adapter.new(execution_mode: :external)
     @user = User.new(login: "avatar-race-#{SecureRandom.hex(4)}", firstname: 'Avatar', lastname: 'Race', mail: "avatar-race-#{SecureRandom.hex(4)}@example.invalid")
@@ -3071,26 +3223,8 @@ class SlackAvatarConcurrencySmokeTest < ActiveSupport::TestCase
     rows = GoodJob::Job.where(job_class: 'RedmineSlack::AvatarRefreshJob').where("serialized_params->'arguments'->>0 = ?", @user.id.to_s)
     assert_equal 0, rows.count
 
-    barrier = Queue.new
-    ready = Queue.new
-    backends = Queue.new
     user_id = @user.id
-    threads = Array.new(THREADS) do
-      Thread.new do
-        Rails.application.executor.wrap do
-          ActiveRecord::Base.connection_pool.with_connection do |connection|
-            backends << connection.select_value('SELECT pg_backend_pid()')
-            ready << true
-            barrier.pop
-            RedmineSlack::AvatarCache.request_refresh(user_id, 'URACE0001')
-          end
-        end
-      end
-    end
-    THREADS.times { ready.pop }
-    THREADS.times { barrier << true }
-    threads.each { |thread| assert thread.join(60), 'a refresh request did not finish' }
-    pids = Array.new(THREADS) { backends.pop }
+    pids = run_simultaneously(THREADS) { RedmineSlack::AvatarCache.request_refresh(user_id, 'URACE0001') }
     assert_equal THREADS, pids.uniq.length, 'requests did not use independent connections'
 
     assert_equal 1, rows.count
@@ -3098,5 +3232,50 @@ class SlackAvatarConcurrencySmokeTest < ActiveSupport::TestCase
     assert_equal rows.first.active_job_id, state[:job_id]
     assert_equal 'URACE0001', state[:member_id]
     assert_nil rows.first.finished_at
+  end
+
+  def test_an_insufficient_connection_pool_is_reported_without_starting_workers
+    pool = ActiveRecord::Base.connection_pool
+    threads = Thread.list
+    error = assert_raises(RuntimeError) { run_simultaneously(pool.size + 1) { flunk 'must not run' } }
+    assert_match(/connection pool cannot supply #{pool.size + 1} worker connections/, error.message)
+    assert_equal threads, Thread.list
+  end
+
+  def test_a_worker_failing_before_it_is_ready_is_raised_without_hanging_and_releases_everything
+    pool = ActiveRecord::Base.connection_pool
+    busy = pool.stat[:busy]
+    threads = Thread.list
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    error = assert_raises(ArgumentError) do
+      run_simultaneously(THREADS, prepare: ->(index) { raise ArgumentError, 'worker failed early' if index == 2 }) { flunk 'must not run after a failed worker' }
+    end
+    assert_equal 'worker failed early', error.message
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, TIMEOUT / 4
+    assert_equal threads, Thread.list
+    assert_equal busy, pool.stat[:busy]
+  end
+
+  def test_a_worker_failing_while_working_is_raised_and_everything_is_released
+    pool = ActiveRecord::Base.connection_pool
+    busy = pool.stat[:busy]
+    threads = Thread.list
+    error = assert_raises(IOError) { run_simultaneously(3) { |index| raise IOError, 'worker failed' if index == 1 } }
+    assert_equal 'worker failed', error.message
+    assert_equal threads, Thread.list
+    assert_equal busy, pool.stat[:busy]
+  end
+
+  def test_workers_that_never_become_ready_hit_the_deadline_and_are_released
+    pool = ActiveRecord::Base.connection_pool
+    busy = pool.stat[:busy]
+    threads = Thread.list
+    stuck = Queue.new
+    error = assert_raises(RuntimeError) do
+      run_simultaneously(2, timeout: 0.5, prepare: ->(index) { stuck.pop if index == 0 }) { flunk 'must not run' }
+    end
+    assert_match(/workers were not ready within 0\.5s/, error.message)
+    assert_equal threads, Thread.list
+    assert_equal busy, pool.stat[:busy]
   end
 end

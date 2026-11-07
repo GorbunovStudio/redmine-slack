@@ -17,7 +17,7 @@ module RedmineSlack
         held = @user.association(:preference).target
         pref = UserPreference.lock.find_by(user_id: @user.id)
         if pref
-          carry_unsaved_changes(held, pref) if held&.persisted? && held.changed?
+          carry_unsaved_changes(held, pref) if held&.changed?
         else
           pref = @user.pref
         end
@@ -42,9 +42,14 @@ module RedmineSlack
     private
 
     # Applies only what the caller changed locally onto the freshly locked record,
-    # so newer persisted values are not overwritten by the caller's older copy.
+    # so newer persisted values are not overwritten by the caller's older copy. For a
+    # preference object the caller never saved (another caller created the row first),
+    # "changed" means differing from the initialization defaults, which must not
+    # replace the other caller's explicitly saved settings.
     def carry_unsaved_changes(held, pref)
+      defaults = UserPreference.new if held.new_record?
       held.changes_to_save.each do |name, (old, current)|
+        old = defaults[name] if defaults
         if name == 'others'
           old ||= {}
           current ||= {}
@@ -52,7 +57,7 @@ module RedmineSlack
           old.each_key { |key| merged.delete(key) unless current.key?(key) }
           current.each { |key, value| merged[key] = value unless old.key?(key) && old[key] == value }
           pref.others = merged
-        else
+        elsif !defaults || current != old
           pref[name] = current
         end
       end

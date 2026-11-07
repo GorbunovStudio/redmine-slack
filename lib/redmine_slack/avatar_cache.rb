@@ -107,11 +107,11 @@ module RedmineSlack
         stored = others[KEY]
         return {} unless stored.is_a?(Hash) && stored[:member_id] == member
 
-        {
-          url: (stored[:url] if stored[:url].is_a?(String)),
-          refresh_after: (stored[:refresh_after] if stored[:refresh_after].is_a?(Integer)),
-          job_id: (stored[:job_id] if stored[:job_id].is_a?(String))
-        }
+        url, refresh_after, job_id = stored.values_at(:url, :refresh_after, :job_id)
+        # A nil url is a valid negative cache; any other malformed field makes the whole state uncached.
+        return {} unless (url.nil? || url.is_a?(String)) && refresh_after.is_a?(Integer) && job_id.is_a?(String)
+
+        {url: url, refresh_after: refresh_after, job_id: job_id}
       end
 
       def due?(state)
