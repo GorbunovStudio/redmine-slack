@@ -7,6 +7,7 @@ prepare_patches = proc do
 	MyController.include RedmineSlack::MyControllerPatch unless MyController < RedmineSlack::MyControllerPatch
 	UsersController.include RedmineSlack::UsersControllerPatch unless UsersController < RedmineSlack::UsersControllerPatch
 	SettingsController.prepend RedmineSlack::SettingsPatch unless SettingsController < RedmineSlack::SettingsPatch
+	AvatarsHelper.prepend RedmineSlack::AvatarsHelperPatch unless AvatarsHelper < RedmineSlack::AvatarsHelperPatch
 end
 # Redmine runs this file again after every code reload; Zeitwerk loads lib/.
 prepare_patches.call

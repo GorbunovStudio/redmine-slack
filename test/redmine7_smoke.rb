@@ -5,7 +5,7 @@ require 'tempfile'
 
 module SlackSmokeTransport
   class << self
-    attr_accessor :requests, :status, :error, :body, :headers, :responses
+    attr_accessor :requests, :status, :error, :body, :headers, :responses, :before_response
   end
   self.requests = []
   self.status = 200
@@ -37,6 +37,7 @@ module SlackSmokeTransport
     raise 'Unexpected HTTP request' unless synthetic_upload || synthetic_file || allowed.fetch(method).any? { |name| endpoint == "https://slack.com/api/#{name}" }
     raise SlackSmokeTransport.error if SlackSmokeTransport.error
     SlackSmokeTransport.requests << {method: method, url: url.to_s, body: body, headers: headers}
+    SlackSmokeTransport.before_response&.call
     response = SlackSmokeTransport.responses&.shift
     Struct.new(:status, :body, :headers).new(*(response || [SlackSmokeTransport.status, SlackSmokeTransport.body, SlackSmokeTransport.headers]))
   end
@@ -202,7 +203,38 @@ class SlackDependencySmokeTest < ActiveSupport::TestCase
   end
 end
 
+module SlackAvatarTestHelper
+  AVATAR_URL = 'https://avatars.slack-edge.com/2026-01-01/synthetic_512.png'.freeze
+
+  def avatar_cache
+    RedmineSlack::AvatarCache
+  end
+
+  def stored_preferences(user)
+    UserPreference.where(user_id: user.id).pick(:others)
+  end
+
+  def avatar_state(user)
+    stored_preferences(user)[:rslack_avatar]
+  end
+
+  def seed_avatar_state(user, member, url: AVATAR_URL, refresh_after: Time.current.to_i + 24.hours.to_i, job_id: SecureRandom.uuid)
+    pref = UserPreference.find_by!(user_id: user.id)
+    pref[:rslack_avatar] = {member_id: member, url: url, refresh_after: refresh_after, job_id: job_id}
+    pref.save!
+  end
+
+  def create_avatar_user(login, username = nil)
+    user = User.new(login: login, firstname: 'Avatar', lastname: 'Fixture', mail: "#{login}@example.invalid")
+    user.password = user.password_confirmation = 'FixturePassword_104!'
+    user.save!
+    user.rslack_preference[:username] = username if username
+    user
+  end
+end
+
 class SlackWorkflowSmokeTest < ActionController::TestCase
+  include SlackAvatarTestHelper
   tests IssuesController
 
   def html(text)
@@ -270,6 +302,7 @@ class SlackWorkflowSmokeTest < ActionController::TestCase
     SlackSmokeTransport.body = '{"ok":true}'
     SlackSmokeTransport.headers = {}
     SlackSmokeTransport.responses = nil
+    SlackSmokeTransport.before_response = nil
   end
 
 end
@@ -1605,6 +1638,21 @@ class SlackMyAccountSmokeTest < SlackWorkflowSmokeTest
     assert_response :redirect
     assert_equal 'UACCOUNT01', User.find(@user.id).rslack_preference[:username]
   end
+
+  def test_account_save_invalidates_avatar_state_only_for_a_changed_association
+    @user.rslack_preference[:username] = 'UACCOUNT01'
+    seed_avatar_state(@user, 'UACCOUNT01')
+    before = avatar_state(@user)
+    get :account
+    csrf_token = css_select('meta[name="csrf-token"]').first['content']
+    put :account, params: {authenticity_token: csrf_token, user: {firstname: @user.firstname}, pref: {}, redmine_slack: {username: ' UACCOUNT01 '}}
+    assert_response :redirect
+    assert_equal before, avatar_state(@user)
+    put :account, params: {authenticity_token: csrf_token, user: {firstname: @user.firstname}, pref: {}, redmine_slack: {username: 'UACCOUNT02'}}
+    assert_response :redirect
+    assert_equal 'UACCOUNT02', stored_preferences(@user)[:rslack_username]
+    assert_nil avatar_state(@user)
+  end
 end
 
 class SlackUserAdminSmokeTest < SlackWorkflowSmokeTest
@@ -1633,6 +1681,21 @@ class SlackUserAdminSmokeTest < SlackWorkflowSmokeTest
     put :update, params: {id: @user.id, authenticity_token: csrf_token, user: {firstname: ''}, pref: {}, redmine_slack: {username: 'UMUSTNOTSAVE'}}
     assert_response :success
     assert_equal 'UADMIN001', User.find(@user.id).rslack_preference[:username]
+  end
+
+  def test_failed_update_keeps_association_and_avatar_state
+    @user.rslack_preference[:username] = 'UADMIN002'
+    seed_avatar_state(@user, 'UADMIN002')
+    before = stored_preferences(@user)
+    get :edit, params: {id: @user.id}
+    csrf_token = css_select('meta[name="csrf-token"]').first['content']
+    put :update, params: {id: @user.id, authenticity_token: csrf_token, user: {firstname: ''}, pref: {}, redmine_slack: {username: 'UMUSTNOTSAVE'}}
+    assert_response :success
+    assert_equal before, stored_preferences(@user)
+    put :update, params: {id: @user.id, authenticity_token: csrf_token, user: {firstname: @user.firstname}, pref: {}, redmine_slack: {username: 'UADMIN003'}}
+    assert_response :redirect
+    assert_equal 'UADMIN003', stored_preferences(@user)[:rslack_username]
+    assert_nil avatar_state(@user)
   end
 end
 
@@ -2293,5 +2356,747 @@ class SlackDeliverySmokeTest < SlackWorkflowSmokeTest
     assert_includes envelope['attachments'].first[:text], 'fixture-revision'
     refute_includes envelope['attachments'].first[:text], 'translation missing'
     assert_equal 'Fixture changeset update', issue.journals.order(id: :desc).first.notes
+  end
+end
+
+class SlackAvatarSmokeTest < SlackWorkflowSmokeTest
+  include ActiveSupport::Testing::TimeHelpers
+
+  setup do
+    ActiveJob::Base.queue_adapter = :test
+    Setting.gravatar_enabled = '1'
+    Setting.gravatar_default = 'mm'
+    Setting.plugin_redmine_slack = Setting.plugin_redmine_slack.merge('bot_token' => 'fixture-token')
+    @flags = Setting.plugin_redmine_slack.slice('delivery_enabled', 'import_enabled')
+    @helper = ApplicationController.helpers
+    @subject = create_avatar_user('avatar-subject', ' UAVATAR01 ')
+  end
+
+  teardown do
+    assert_equal @flags, Setting.plugin_redmine_slack.slice('delivery_enabled', 'import_enabled')
+    assert_empty SlackSmokeTransport.requests.reject { |request| request[:url] == 'https://slack.com/api/users.info' }
+  end
+
+  private
+
+  def queued_jobs
+    ActiveJob::Base.queue_adapter.enqueued_jobs
+  end
+
+  def avatar_job_rows
+    GoodJob::Job.where(job_class: 'RedmineSlack::AvatarRefreshJob')
+  end
+
+  def request_job(user = @subject)
+    queued_jobs.clear
+    avatar_cache.url_for(user)
+    queued_jobs.last
+  end
+
+  def profile_body(**fields)
+    {ok: true, user: {id: 'UAVATAR01', profile: fields.transform_keys(&:to_s)}}.to_json
+  end
+
+  def set_token(token)
+    Setting.plugin_redmine_slack = Setting.plugin_redmine_slack.merge('bot_token' => token)
+  end
+
+  def in_24_hours
+    Time.current.to_i + 24.hours.to_i
+  end
+
+  def capture_log
+    io = StringIO.new
+    previous = Rails.logger
+    Rails.logger = ActiveSupport::Logger.new(io)
+    yield
+    io.string
+  ensure
+    Rails.logger = previous
+  end
+end
+
+class SlackAvatarCacheSmokeTest < SlackAvatarSmokeTest
+  def test_url_compatibility_follows_the_gravatar_default_contract
+    %w[https://a.example.invalid/p/x.jpg https://a.example.invalid/p/x.JPEG https://a.example.invalid/x.gif
+       https://a.example.invalid/x.png https://a.example.invalid/x.heic https://a.example.invalid:443/x.png].each do |url|
+      assert_equal url, avatar_cache.compatible_url(url), url
+    end
+    ['http://a.example.invalid/x.png', 'https://a.example.invalid/x.png?s=512', 'https://a.example.invalid/x.png?',
+     'https://a.example.invalid/x.png#fragment', 'https://user:secret@a.example.invalid/x.png', 'https://a.example.invalid:8443/x.png',
+     'https://a.example.invalid/x', 'https://a.example.invalid/x.svg', 'https:///x.png', 'ftp://a.example.invalid/x.png',
+     'not a url', '', nil, 42, ['https://a.example.invalid/x.png']].each do |value|
+      assert_nil avatar_cache.compatible_url(value), value.inspect
+    end
+    assert_empty SlackSmokeTransport.requests
+  end
+
+  def test_largest_compatible_numeric_image_is_selected_without_rewriting
+    profile = {
+      'image_24' => 'https://a.example.invalid/24.png', 'image_72' => 'https://a.example.invalid/72.jpg',
+      'image_192' => 'https://a.example.invalid/192.gif', 'image_512' => 'https://a.example.invalid/512.png?s=512',
+      'image_1024' => 'http://a.example.invalid/1024.png', 'image_original' => 'https://a.example.invalid/original.png',
+      'image_big' => 'https://a.example.invalid/big.png', 'image_2048' => 2048, 'is_custom_image' => false
+    }
+    assert_equal 'https://a.example.invalid/192.gif', avatar_cache.image_url('user' => {'profile' => profile})
+    generated = {'image_512' => 'https://a.example.invalid/generated_512.png'}
+    assert_equal 'https://a.example.invalid/generated_512.png', avatar_cache.image_url('user' => {'profile' => generated.merge('is_custom_image' => false)})
+    assert_equal 'https://a.example.invalid/generated_512.png', avatar_cache.image_url('user' => {'profile' => generated})
+    [{}, {'user' => {}}, {'user' => 'x'}, {'user' => {'profile' => 'x'}}, {'user' => {'profile' => {}}}, nil, 'x',
+     {'user' => {'profile' => {'image_original' => 'https://a.example.invalid/o.png', 'image_x' => 'https://a.example.invalid/x.png'}}},
+     {'user' => {'profile' => {'image_24' => 'https://a.example.invalid/24.png?query=1'}}}].each do |response|
+      assert_nil avatar_cache.image_url(response), response.inspect
+    end
+    assert_empty SlackSmokeTransport.requests
+  end
+
+  def test_state_is_visible_to_fresh_instances_and_bound_to_the_association
+    job = request_job
+    assert_equal 1, queued_jobs.length
+    job_id = avatar_state(@subject)[:job_id]
+    assert avatar_cache.finish(@subject.id, 'UAVATAR01', job_id, url: AVATAR_URL)
+    state = UserPreference.find_by!(user_id: @subject.id)[:rslack_avatar]
+    assert_equal %i[job_id member_id refresh_after url], state.keys.sort
+    assert_equal AVATAR_URL, avatar_cache.url_for(User.find(@subject.id))
+    @subject.pref
+    User.find(@subject.id).rslack_preference[:username] = 'UAVATAR02'
+    assert_equal 'UAVATAR01', @subject.pref[:rslack_username]
+    assert_nil avatar_cache.url_for(@subject)
+    assert_equal job_id, job['job_id']
+  end
+
+  def test_malformed_or_foreign_state_is_uncached_and_refreshes
+    malformed = [nil, 'text', [], {}, {url: AVATAR_URL}, {member_id: 'UAVATAR01', url: 5, refresh_after: 'soon', job_id: 7},
+                 {member_id: 'UOTHER99', url: AVATAR_URL, refresh_after: in_24_hours, job_id: 'foreign-job'}]
+    malformed.each do |value|
+      pref = UserPreference.find_by!(user_id: @subject.id)
+      pref[:rslack_avatar] = value
+      pref.save!
+      queued_jobs.clear
+      assert_nil avatar_cache.url_for(@subject), value.inspect
+      assert_equal 1, queued_jobs.length, value.inspect
+      assert_equal 'UAVATAR01', avatar_state(@subject)[:member_id]
+    end
+  end
+
+  def test_completion_keeps_newer_unrelated_preferences_and_current_association
+    request_job
+    job_id = avatar_state(@subject)[:job_id]
+    other = UserPreference.find_by!(user_id: @subject.id)
+    other.textarea_font = 'proportional'
+    other.save!
+    assert avatar_cache.finish(@subject.id, 'UAVATAR01', job_id, url: AVATAR_URL)
+    fresh = UserPreference.find_by!(user_id: @subject.id)
+    assert_equal 'proportional', fresh.textarea_font
+    assert_equal 'UAVATAR01', fresh[:rslack_username]
+    assert_equal AVATAR_URL, fresh[:rslack_avatar][:url]
+  end
+end
+
+class SlackAvatarPreferenceSmokeTest < SlackAvatarSmokeTest
+  def test_same_association_keeps_cache_and_changes_invalidate_it
+    seed_avatar_state(@subject, 'UAVATAR01')
+    before = avatar_state(@subject)
+    User.find(@subject.id).rslack_preference[:username] = '  UAVATAR01 '
+    assert_equal before, avatar_state(@subject)
+    assert_equal AVATAR_URL, avatar_cache.url_for(User.find(@subject.id))
+    User.find(@subject.id).rslack_preference[:username] = 'UAVATAR02'
+    assert_equal 'UAVATAR02', stored_preferences(@subject)[:rslack_username]
+    assert_nil avatar_state(@subject)
+    seed_avatar_state(@subject, 'UAVATAR02')
+    User.find(@subject.id).rslack_preference[:username] = ''
+    assert_equal '', stored_preferences(@subject)[:rslack_username]
+    assert_nil avatar_state(@subject)
+    User.find(@subject.id).rslack_preference[:username] = 'UAVATAR02'
+    seed_avatar_state(@subject, 'UAVATAR02')
+    User.find(@subject.id).rslack_preference[:username] = 'Legacy Name'
+    assert_equal 'Legacy Name', User.find(@subject.id).rslack_preference[:username]
+    assert_nil avatar_state(@subject)
+  end
+
+  def test_legacy_values_are_preserved_and_do_not_touch_avatar_state
+    @subject.rslack_preference[:username] = 'Legacy Name'
+    assert_equal 'Legacy Name', User.find(@subject.id).rslack_preference[:username]
+    @subject.rslack_preference[:username] = ' Another Legacy '
+    assert_equal 'Another Legacy', User.find(@subject.id).rslack_preference[:username]
+    assert_nil avatar_state(@subject)
+  end
+
+  def test_setter_merges_into_current_persisted_preferences
+    stale = User.find(@subject.id)
+    stale.pref
+    other = UserPreference.find_by!(user_id: @subject.id)
+    other.textarea_font = 'proportional'
+    other.save!
+    seed_avatar_state(@subject, 'UAVATAR01')
+    stale.rslack_preference[:username] = 'UAVATAR03'
+    fresh = UserPreference.find_by!(user_id: @subject.id)
+    assert_equal 'proportional', fresh.textarea_font
+    assert_equal 'UAVATAR03', fresh[:rslack_username]
+    assert_nil fresh[:rslack_avatar]
+    assert_equal 'UAVATAR03', stale.rslack_preference[:username]
+    assert_equal 'proportional', stale.pref.textarea_font
+  end
+
+  def test_setter_preserves_the_callers_dirty_preferences_and_newer_persisted_keys
+    seed_avatar_state(@subject, 'UAVATAR01')
+    held = User.find(@subject.id)
+    held.pref[:rslack_username]
+    old_pref_object = held.pref
+    old_pref_object.hide_mail = !old_pref_object.hide_mail
+    old_pref_object[:default_issue_query] = '77'
+    old_pref_object[:no_self_notified] = nil
+    expected_hide_mail = old_pref_object.hide_mail
+    other = UserPreference.find_by!(user_id: @subject.id)
+    other[:textarea_font] = 'proportional'
+    other[:no_self_notified] = '1'
+    other.save!
+    newer = {member_id: 'UAVATAR01', url: 'https://a.example.invalid/newer_512.png', refresh_after: in_24_hours + 60, job_id: SecureRandom.uuid}
+    other = UserPreference.find_by!(user_id: @subject.id)
+    other[:rslack_avatar] = newer
+    other.save!
+
+    held.rslack_preference[:username] = ' UAVATAR01 '
+    fresh = UserPreference.find_by!(user_id: @subject.id)
+    assert_equal expected_hide_mail, fresh.hide_mail
+    assert_equal '77', fresh[:default_issue_query]
+    assert_equal 'proportional', fresh[:textarea_font]
+    assert_nil fresh[:no_self_notified], "the caller's own local change wins for that key"
+    assert_equal newer, fresh[:rslack_avatar]
+    assert_same old_pref_object, held.pref
+    refute held.pref.changed?
+    assert_equal newer, held.pref[:rslack_avatar]
+    assert_equal 'proportional', held.pref[:textarea_font]
+
+    held.pref[:default_project_query] = '5'
+    other = UserPreference.find_by!(user_id: @subject.id)
+    other[:comments_sorting] = 'desc'
+    other.save!
+    held.rslack_preference[:username] = 'UAVATAR02'
+    fresh = UserPreference.find_by!(user_id: @subject.id)
+    assert_equal '5', fresh[:default_project_query]
+    assert_equal 'desc', fresh[:comments_sorting]
+    assert_equal '77', fresh[:default_issue_query]
+    assert_equal 'UAVATAR02', fresh[:rslack_username]
+    assert_nil fresh[:rslack_avatar]
+    refute held.pref.changed?
+    assert_equal 'UAVATAR02', held.rslack_preference[:username]
+  end
+
+  def test_first_preference_row_is_created_by_the_setter
+    UserPreference.where(user_id: @subject.id).delete_all
+    user = User.find(@subject.id)
+    user.rslack_preference[:username] = ' UFIRST001 '
+    assert_equal 1, UserPreference.where(user_id: @subject.id).count
+    assert_equal 'UFIRST001', stored_preferences(@subject)[:rslack_username]
+    assert_nil avatar_state(@subject)
+  end
+
+  def test_getter_does_not_write_or_create_avatar_state
+    user = User.find(@subject.id)
+    before = stored_preferences(@subject)
+    assert_equal 'UAVATAR01', user.rslack_preference[:username]
+    refute user.pref.changed?
+    assert_equal before, stored_preferences(@subject)
+    assert_empty queued_jobs
+  end
+
+  def test_unsaved_user_assignment_stays_in_memory
+    user = User.new(login: 'avatar-unsaved', firstname: 'Avatar', lastname: 'Unsaved', mail: 'avatar-unsaved@example.invalid')
+    count = UserPreference.count
+    user.rslack_preference[:username] = ' UUNSAVED1 '
+    assert_equal 'UUNSAVED1', user.pref[:rslack_username]
+    assert_equal count, UserPreference.count
+    assert_nil avatar_cache.url_for(user)
+    assert_empty queued_jobs
+  end
+end
+
+class SlackAvatarFailingAdapter
+  def enqueue(_job)
+    raise ActiveJob::EnqueueError, 'fixture failure'
+  end
+
+  def enqueue_at(_job, _timestamp)
+    raise ActiveJob::EnqueueError, 'fixture failure'
+  end
+end
+
+class SlackAvatarRefreshSmokeTest < SlackAvatarSmokeTest
+  def test_first_render_enqueues_one_secret_free_job_and_never_calls_slack
+    assert_nil avatar_cache.url_for(@subject)
+    3.times { avatar_cache.url_for(User.find(@subject.id)) }
+    assert_equal 1, queued_jobs.length
+    job = queued_jobs.first
+    assert_equal 'slack', job[:queue]
+    assert_equal RedmineSlack::AvatarRefreshJob, job[:job]
+    assert_equal [@subject.id, 'UAVATAR01'], ActiveJob::Arguments.deserialize(job[:args])
+    refute_includes job.inspect, 'fixture-token'
+    refute RedmineSlack::AvatarRefreshJob.log_arguments
+    refute RedmineSlack::AvatarRefreshJob.enqueue_after_transaction_commit
+    state = avatar_state(@subject)
+    assert_equal 'UAVATAR01', state[:member_id]
+    assert_nil state[:url]
+    assert_equal job['job_id'], state[:job_id]
+    assert_in_delta in_24_hours, state[:refresh_after], 5
+    refute_includes stored_preferences(@subject).to_json, 'fixture-token'
+    assert_empty SlackSmokeTransport.requests
+  end
+
+  def test_missing_token_and_ineligible_associations_never_refresh_or_write
+    set_token('')
+    before = stored_preferences(@subject)
+    assert_nil avatar_cache.url_for(@subject)
+    assert_equal before, stored_preferences(@subject)
+    set_token('fixture-token')
+    ['', 'legacy-name', 'person@example.invalid', 'u12345', 'X12345', 'UABC-1'].each do |value|
+      user = create_avatar_user("avatar-ineligible-#{value.hash.abs}", nil)
+      user.rslack_preference[:username] = value
+      before = stored_preferences(user)
+      [true, false].each do |gravatar|
+        Setting.gravatar_enabled = gravatar ? '1' : '0'
+        @helper.avatar(user)
+        avatar_cache.url_for(user)
+      end
+      assert_equal before, stored_preferences(user), value
+    end
+    assert_empty queued_jobs
+    assert_empty SlackSmokeTransport.requests
+  end
+
+  def test_freshness_expires_after_the_existing_identity_cache_interval
+    job = request_job
+    queued_jobs.clear
+    assert avatar_cache.finish(@subject.id, 'UAVATAR01', job['job_id'], url: AVATAR_URL)
+    assert_equal AVATAR_URL, avatar_cache.url_for(@subject)
+    travel 24.hours - 1.minute
+    assert_equal AVATAR_URL, avatar_cache.url_for(@subject)
+    assert_empty queued_jobs
+    travel 2.minutes
+    assert_equal AVATAR_URL, avatar_cache.url_for(@subject)
+    assert_equal 1, queued_jobs.length
+  end
+
+  def test_goodjob_deduplicates_across_delayed_retries_and_releases_finished_or_deleted_work
+    ActiveJob::Base.queue_adapter = GoodJob::Adapter.new(execution_mode: :external)
+    baseline = avatar_job_rows.count
+    assert_nil avatar_cache.url_for(@subject)
+    avatar_cache.request_refresh(@subject.id, 'UAVATAR01')
+    3.times { avatar_cache.url_for(User.find(@subject.id)) }
+    assert_equal baseline + 1, avatar_job_rows.count
+    first = avatar_job_rows.find_by!(active_job_id: avatar_state(@subject)[:job_id])
+    first.update!(scheduled_at: 5.days.from_now)
+    travel_to 2.days.from_now do
+      3.times { avatar_cache.url_for(User.find(@subject.id)) }
+      avatar_cache.request_refresh(@subject.id, 'UAVATAR01')
+      assert_equal baseline + 1, avatar_job_rows.count
+      first.update!(finished_at: Time.current)
+      avatar_cache.url_for(@subject)
+      assert_equal baseline + 2, avatar_job_rows.count
+      avatar_job_rows.find_by!(active_job_id: avatar_state(@subject)[:job_id]).destroy!
+    end
+    travel_to 4.days.from_now do
+      avatar_cache.url_for(@subject)
+      assert_equal baseline + 2, avatar_job_rows.count
+    end
+    assert_empty SlackSmokeTransport.requests
+  end
+
+  def test_rollback_and_failed_enqueue_leave_no_claim
+    ActiveJob::Base.queue_adapter = GoodJob::Adapter.new(execution_mode: :external)
+    baseline = avatar_job_rows.count
+    ActiveRecord::Base.transaction(requires_new: true) do
+      avatar_cache.url_for(@subject)
+      assert_equal baseline + 1, avatar_job_rows.count
+      assert avatar_state(@subject)
+      raise ActiveRecord::Rollback
+    end
+    assert_equal baseline, avatar_job_rows.count
+    assert_nil avatar_state(@subject)
+    ActiveJob::Base.queue_adapter = SlackAvatarFailingAdapter.new
+    assert_nil avatar_cache.url_for(@subject)
+    assert_nil avatar_state(@subject)
+    ActiveJob::Base.queue_adapter = GoodJob::Adapter.new(execution_mode: :external)
+    avatar_cache.url_for(@subject)
+    assert_equal baseline + 1, avatar_job_rows.count
+  end
+
+  def test_successful_refresh_calls_only_users_info_and_is_visible_elsewhere
+    job = request_job
+    SlackSmokeTransport.body = profile_body(image_24: 'https://a.example.invalid/24.png', image_512: AVATAR_URL, image_original: 'https://a.example.invalid/o.png', is_custom_image: false)
+    ActiveJob::Base.execute(job)
+    request = SlackSmokeTransport.requests.sole
+    assert_equal 'GET', request[:method]
+    assert_equal 'https://slack.com/api/users.info', request[:url]
+    assert_equal({user: 'UAVATAR01'}, request[:body])
+    assert_equal 'Bearer fixture-token', request[:headers]['Authorization']
+    state = UserPreference.find_by!(user_id: @subject.id)[:rslack_avatar]
+    assert_equal AVATAR_URL, state[:url]
+    assert_equal job['job_id'], state[:job_id]
+    assert_in_delta in_24_hours, state[:refresh_after], 5
+    assert_equal 1, queued_jobs.length
+    assert_equal AVATAR_URL, avatar_cache.url_for(User.find(@subject.id))
+    refute_includes stored_preferences(@subject).to_json, 'fixture-token'
+    SlackSmokeTransport.requests.clear
+  end
+
+  def test_token_absent_at_execution_or_retry_makes_no_request_and_keeps_cache
+    seed_avatar_state(@subject, 'UAVATAR01', refresh_after: Time.current.to_i - 1)
+    job = request_job
+    set_token('')
+    ActiveJob::Base.execute(job)
+    assert_empty SlackSmokeTransport.requests
+    assert_equal AVATAR_URL, avatar_cache.url_for(@subject)
+    set_token('fixture-token')
+    seed_avatar_state(@subject, 'UAVATAR01', refresh_after: Time.current.to_i - 1)
+    job = request_job
+    SlackSmokeTransport.responses = [[429, '{}', {'Retry-After' => '7'}]]
+    ActiveJob::Base.execute(job)
+    retry_job = queued_jobs.last
+    assert_equal job['job_id'], retry_job['job_id']
+    SlackSmokeTransport.requests.clear
+    set_token('')
+    ActiveJob::Base.execute(retry_job)
+    assert_empty SlackSmokeTransport.requests
+    assert_equal AVATAR_URL, avatar_cache.url_for(@subject)
+  end
+
+  def test_rate_limit_and_transient_failures_reschedule_without_a_competing_refresh
+    [[[429, '{}', {'Retry-After' => '7'}], 7], [[429, '{}', {'Retry-After' => 'invalid'}], 3], [[429, '{}', {}], 3],
+     [[503, '{}', {}], 3], [[200, '{"ok":false,"error":"internal_error"}', {}], 3]].each do |response, wait|
+      queued_jobs.clear
+      SlackSmokeTransport.requests.clear
+      UserPreference.find_by!(user_id: @subject.id).tap { |pref| avatar_cache.clear(pref); pref.save! }
+      job = request_job
+      before = avatar_state(@subject)
+      SlackSmokeTransport.responses = [response]
+      ActiveJob::Base.execute(job)
+      retry_job = queued_jobs.last
+      assert_equal 2, queued_jobs.length
+      assert_equal job['job_id'], retry_job['job_id']
+      assert_in_delta Time.now.to_f + wait, retry_job[:at], 2
+      assert_equal before, avatar_state(@subject)
+      avatar_cache.url_for(User.find(@subject.id))
+      assert_equal 2, queued_jobs.length
+      queued_jobs.clear
+      SlackSmokeTransport.responses = [[200, profile_body(image_512: AVATAR_URL), {}]]
+      ActiveJob::Base.execute(retry_job)
+      assert_equal AVATAR_URL, avatar_state(@subject)[:url]
+    end
+  end
+
+  def test_exhausted_transient_retries_keep_the_stale_image_and_suppress_for_24_hours
+    seed_avatar_state(@subject, 'UAVATAR01', refresh_after: Time.current.to_i - 1)
+    job = request_job
+    queued_jobs.clear
+    original = avatar_state(@subject)[:refresh_after]
+    travel 2.hours
+    SlackSmokeTransport.status = 503
+    ActiveJob::Base.execute(job)
+    4.times { ActiveJob::Base.execute(queued_jobs.shift || flunk('missing retry')) }
+    assert_empty queued_jobs
+    assert_equal 5, SlackSmokeTransport.requests.length
+    state = avatar_state(@subject)
+    assert_equal AVATAR_URL, state[:url]
+    assert_in_delta original + 2.hours.to_i, state[:refresh_after], 5
+    assert_equal AVATAR_URL, avatar_cache.url_for(@subject)
+    assert_empty queued_jobs
+    travel 24.hours - 1.minute
+    avatar_cache.url_for(@subject)
+    assert_empty queued_jobs
+    travel 2.minutes
+    assert_equal AVATAR_URL, avatar_cache.url_for(@subject)
+    assert_equal 1, queued_jobs.length
+    SlackSmokeTransport.requests.clear
+  end
+
+  def test_permanent_errors_keep_stale_image_log_only_a_safe_code_and_do_not_retry
+    seed_avatar_state(@subject, 'UAVATAR01', refresh_after: Time.current.to_i - 1)
+    job = request_job
+    queued_jobs.clear
+    original = avatar_state(@subject)[:refresh_after]
+    travel 3.hours
+    SlackSmokeTransport.body = '{"ok":false,"error":"missing_scope"}'
+    log = capture_log { ActiveJob::Base.execute(job) }
+    assert_includes log, 'Slack avatar refresh dropped (missing_scope)'
+    [AVATAR_URL, 'fixture-token', 'UAVATAR01'].each { |secret| refute_includes log, secret }
+    assert_empty queued_jobs
+    state = avatar_state(@subject)
+    assert_equal AVATAR_URL, state[:url]
+    assert_in_delta original + 3.hours.to_i, state[:refresh_after], 5
+    avatar_cache.url_for(@subject)
+    assert_empty queued_jobs
+    SlackSmokeTransport.requests.clear
+  end
+
+  def test_successful_profile_without_a_compatible_picture_clears_the_cache
+    seed_avatar_state(@subject, 'UAVATAR01', refresh_after: Time.current.to_i - 1)
+    job = request_job
+    SlackSmokeTransport.body = profile_body(image_512: 'https://a.example.invalid/512.png?x=1', image_original: 'https://a.example.invalid/o.png')
+    ActiveJob::Base.execute(job)
+    state = avatar_state(@subject)
+    assert_nil state[:url]
+    assert_in_delta in_24_hours, state[:refresh_after], 5
+    assert_nil avatar_cache.url_for(@subject)
+    assert_equal 1, queued_jobs.length
+    SlackSmokeTransport.requests.clear
+  end
+
+  def test_changed_association_before_or_during_execution_discards_obsolete_work
+    job = request_job
+    User.find(@subject.id).rslack_preference[:username] = 'UAVATAR02'
+    SlackSmokeTransport.body = profile_body(image_512: AVATAR_URL)
+    ActiveJob::Base.execute(job)
+    assert_empty SlackSmokeTransport.requests
+    assert_nil avatar_state(@subject)
+    avatar_cache.url_for(@subject)
+    assert_equal 'UAVATAR02', avatar_state(@subject)[:member_id]
+    assert_equal 2, queued_jobs.length
+
+    queued_jobs.clear
+    UserPreference.find_by!(user_id: @subject.id).tap { |pref| avatar_cache.clear(pref); pref.save! }
+    job = request_job
+    subject_id = @subject.id
+    SlackSmokeTransport.before_response = -> { User.find(subject_id).rslack_preference[:username] = 'UAVATAR03' }
+    ActiveJob::Base.execute(job)
+    SlackSmokeTransport.before_response = nil
+    assert_equal 'UAVATAR03', stored_preferences(@subject)[:rslack_username]
+    assert_nil avatar_state(@subject)
+    SlackSmokeTransport.before_response = -> { User.find(subject_id).rslack_preference[:username] = '' }
+    job = request_job(User.find(subject_id).tap { |user| user.rslack_preference[:username] = 'UAVATAR04' })
+    ActiveJob::Base.execute(job)
+    assert_equal '', stored_preferences(@subject)[:rslack_username]
+    assert_nil avatar_state(@subject)
+    SlackSmokeTransport.requests.clear
+  end
+
+  def test_a_to_b_to_a_sequence_cannot_restore_the_old_result
+    job_a = request_job
+    subject_id = @subject.id
+    User.find(subject_id).rslack_preference[:username] = 'UAVATAR02'
+    avatar_cache.url_for(User.find(subject_id))
+    User.find(subject_id).rslack_preference[:username] = 'UAVATAR01'
+    job_a2 = request_job(User.find(subject_id))
+    refute_equal job_a['job_id'], job_a2['job_id']
+    ActiveJob::Base.execute(job_a)
+    assert_empty SlackSmokeTransport.requests
+    assert_equal job_a2['job_id'], avatar_state(@subject)[:job_id]
+    assert_nil avatar_state(@subject)[:url]
+
+    queued_jobs.clear
+    UserPreference.find_by!(user_id: subject_id).tap { |pref| avatar_cache.clear(pref); pref.save! }
+    job = request_job
+    created = nil
+    SlackSmokeTransport.before_response = lambda do
+      User.find(subject_id).rslack_preference[:username] = 'UAVATAR02'
+      User.find(subject_id).rslack_preference[:username] = 'UAVATAR01'
+      avatar_cache.url_for(User.find(subject_id))
+      created = queued_jobs.last['job_id']
+    end
+    SlackSmokeTransport.body = profile_body(image_512: AVATAR_URL)
+    ActiveJob::Base.execute(job)
+    SlackSmokeTransport.before_response = nil
+    refute_equal job['job_id'], created
+    state = avatar_state(@subject)
+    assert_equal created, state[:job_id]
+    assert_nil state[:url]
+    SlackSmokeTransport.requests.clear
+  end
+end
+
+class SlackAvatarHelperSmokeTest < SlackAvatarSmokeTest
+  def core_avatar(user, **options)
+    AvatarsHelper.instance_method(:avatar).super_method.bind(@helper).call(user, options)
+  end
+
+  def image(html)
+    Nokogiri::HTML5.fragment(html.to_s).at_css('img')
+  end
+
+  def query(url)
+    URI.decode_www_form(URI(url).query).to_h
+  end
+
+  def raw_default(url)
+    URI(url).query[/default=[^&]*/]
+  end
+
+  def test_gravatar_default_is_the_same_encoded_slack_url_at_both_densities
+    cold = image(@helper.avatar(@subject, size: 32, class: 'extra', title: 'Custom'))
+    assert_equal 'mm', query(cold['src'])['default']
+    assert_equal 1, queued_jobs.length
+    queued_jobs.clear
+    seed_avatar_state(@subject, 'UAVATAR01')
+    node = image(@helper.avatar(@subject, size: 32, class: 'extra', title: 'Custom'))
+    digest = Digest::SHA256.hexdigest(@subject.mail.downcase)
+    src = URI(node['src'])
+    srcset = URI(node['srcset'].split.first)
+    assert_equal "/avatar/#{digest}", src.path[/\/avatar\/\h+\z/]
+    assert_equal "/avatar/#{digest}", srcset.path[/\/avatar\/\h+\z/]
+    assert_equal({'rating' => 'PG', 'size' => '32', 'default' => AVATAR_URL}, query(node['src']))
+    assert_equal({'rating' => 'PG', 'size' => '64', 'default' => AVATAR_URL}, query(node['srcset'].split.first))
+    assert_equal '2x', node['srcset'].split.last
+    assert_equal "default=#{CGI.escape(AVATAR_URL)}", raw_default(node['src'])
+    assert_equal raw_default(node['src']), raw_default(node['srcset'].split.first)
+    assert_equal %w[avatar extra gravatar s32], node['class'].split.sort
+    assert_equal 'Custom', node['title']
+    assert_equal '', node['alt']
+    assert_equal cold.attributes.except('src', 'srcset').transform_values(&:value), node.attributes.except('src', 'srcset').transform_values(&:value)
+    assert_equal cold['src'].sub(/default=[^&]*/, 'default=X'), node['src'].sub(/default=[^&]*/, 'default=X')
+    assert_equal 1, node['class'].split.count('s32')
+    if defined?(Additionals::Patches::GravatarPatch)
+      assert GravatarHelper::PublicMethods.ancestors.any? { |mod| mod.name.to_s.start_with?('Additionals::Patches::GravatarPatch') }
+    end
+    assert_equal @subject.name, image(@helper.avatar(@subject))['title']
+    assert_empty queued_jobs
+    assert_empty SlackSmokeTransport.requests
+  end
+
+  def test_cold_unusable_or_ineligible_gravatar_rendering_is_unchanged
+    %w[mm initials identicon].each do |default|
+      Setting.gravatar_default = default
+      options = {size: 40, class: 'x', title: 'T'}
+      queued_jobs.clear
+      cold = @helper.avatar(@subject, options.dup)
+      assert_equal 1, queued_jobs.length
+      seed_avatar_state(@subject, 'UAVATAR01', url: nil)
+      unusable = @helper.avatar(@subject, options.dup)
+      User.find(@subject.id).rslack_preference[:username] = 'Legacy Name'
+      reference = @helper.avatar(@subject, options.dup)
+      assert_equal reference, cold
+      assert_equal reference, unusable
+      assert_equal default, query(image(reference)['src'])['default']
+      User.find(@subject.id).rslack_preference[:username] = 'UAVATAR01'
+    end
+    assert_empty SlackSmokeTransport.requests
+  end
+
+  def test_gravatar_disabled_renders_the_cached_picture_before_initials
+    Setting.gravatar_enabled = '0'
+    cold = @helper.avatar(@subject, size: 40)
+    assert_equal core_avatar(@subject, size: 40), cold
+    assert_includes cold, 'avatar-color-'
+    assert_equal 1, queued_jobs.length
+    seed_avatar_state(@subject, 'UAVATAR01')
+    node = image(@helper.avatar(@subject, size: 40, class: 'x avatar', title: 'Custom', alt: 'Alt', rating: 'X', default: 'nope'))
+    assert_equal AVATAR_URL, node['src']
+    assert_equal %w[avatar s40 x], node['class'].split.sort
+    assert_equal 'Custom', node['title']
+    assert_equal 'Alt', node['alt']
+    assert_equal %w[alt class height src title width], node.attributes.keys.sort
+    assert_equal %w[40 40], [node['width'], node['height']]
+    default = image(@helper.avatar(@subject))
+    assert_equal %w[avatar s24], default['class'].split.sort
+    assert_equal %w[24 24], [default['width'], default['height']]
+    assert_equal @subject.name, default['title']
+    assert_equal '', default['alt']
+    assert_equal AVATAR_URL, image(@helper.assignee_avatar(@subject, size: 16))['src']
+    assert_includes image(@helper.assignee_avatar(@subject, size: 16))['title'], @subject.name
+    seed_avatar_state(@subject, 'UAVATAR01', refresh_after: Time.current.to_i - 1)
+    queued_jobs.clear
+    assert_equal AVATAR_URL, image(@helper.avatar(@subject))['src']
+    assert_equal 1, queued_jobs.length
+    assert_empty SlackSmokeTransport.requests
+  end
+
+  def test_direct_image_has_explicit_dimensions_for_any_requested_size
+    Setting.gravatar_enabled = '0'
+    seed_avatar_state(@subject, 'UAVATAR01')
+    [13, 14, 16, 18, 20, 22, 24, 28, 32, 36, 40, 50, '14', '18'].each do |size|
+      node = image(@helper.avatar(@subject, size: size, style: 'border: 1px solid red'))
+      assert_equal [size.to_s, size.to_s], [node['width'], node['height']], size.inspect
+      assert_includes node['class'].split, "s#{size}"
+      assert_equal 1, node['class'].split.count('avatar')
+      assert_equal 'border: 1px solid red', node['style']
+      assert_equal AVATAR_URL, node['src']
+      assert_nil node['size']
+    end
+    node = image(@helper.avatar(@subject, size: 14, width: 20))
+    assert_equal %w[20 14], [node['width'], node['height']]
+    assert_equal %w[24 24], image(@helper.avatar(@subject)).then { |n| [n['width'], n['height']] }
+    assert_empty queued_jobs
+  end
+
+  def test_special_inputs_follow_the_existing_paths_in_both_modes
+    group = Group.new(lastname: 'avatar-fixture-group')
+    group.save!
+    unsaved = User.new(login: 'avatar-unsaved', firstname: 'Avatar', lastname: 'Unsaved', mail: 'avatar-unsaved@example.invalid')
+    unsaved.id = 987_654_321
+    unsaved.rslack_preference[:username] = 'UUNSAVED1'
+    inputs = [User.anonymous, group, 'Joe <joe@example.invalid>', unsaved]
+    [true, false].each do |gravatar|
+      Setting.gravatar_enabled = gravatar ? '1' : '0'
+      inputs.each do |input|
+        output = @helper.avatar(input, size: 20, class: 'x')
+        assert_equal core_avatar(input, size: 20, class: 'x'), output
+        refute_includes output.to_s, AVATAR_URL
+      end
+    end
+    assert_includes @helper.avatar(User.anonymous), 'anonymous-avatar'
+    assert_includes @helper.avatar(group), 'group-avatar'
+    assert_empty queued_jobs
+    assert_empty SlackSmokeTransport.requests
+  end
+end
+
+# Independent database connections need committed rows, so this class does not use the
+# rolled-back transaction of the other smoke tests. It creates one synthetic user and removes
+# everything it committed. GoodJob stays in external mode: no worker runs and nothing is sent.
+class SlackAvatarConcurrencySmokeTest < ActiveSupport::TestCase
+  THREADS = 6
+
+  setup do
+    raise 'Run only against the upgraded local db service' unless ActiveRecord::Base.connection_db_config.host == 'db'
+    raise 'Local Slack delivery must start disabled in plugin settings' if Setting.plugin_redmine_slack.with_indifferent_access[:delivery_enabled] == '1'
+    @previous_adapter = ActiveJob::Base.queue_adapter
+  end
+
+  teardown do
+    ActiveJob::Base.queue_adapter = @previous_adapter if @previous_adapter
+    if @user
+      GoodJob::Job.where(job_class: 'RedmineSlack::AvatarRefreshJob').where("serialized_params->'arguments'->>0 = ?", @user.id.to_s).delete_all
+      EmailAddress.where(user_id: @user.id).delete_all
+      UserPreference.where(user_id: @user.id).delete_all
+      User.where(id: @user.id).delete_all
+    end
+  end
+
+  def test_simultaneous_cold_refresh_requests_on_separate_connections_yield_one_outstanding_job
+    ActiveJob::Base.queue_adapter = GoodJob::Adapter.new(execution_mode: :external)
+    @user = User.new(login: "avatar-race-#{SecureRandom.hex(4)}", firstname: 'Avatar', lastname: 'Race', mail: "avatar-race-#{SecureRandom.hex(4)}@example.invalid")
+    @user.password = @user.password_confirmation = 'FixturePassword_104!'
+    @user.save!
+    @user.rslack_preference[:username] = 'URACE0001'
+    assert_nil UserPreference.find_by!(user_id: @user.id)[:rslack_avatar]
+    rows = GoodJob::Job.where(job_class: 'RedmineSlack::AvatarRefreshJob').where("serialized_params->'arguments'->>0 = ?", @user.id.to_s)
+    assert_equal 0, rows.count
+
+    barrier = Queue.new
+    ready = Queue.new
+    backends = Queue.new
+    user_id = @user.id
+    threads = Array.new(THREADS) do
+      Thread.new do
+        Rails.application.executor.wrap do
+          ActiveRecord::Base.connection_pool.with_connection do |connection|
+            backends << connection.select_value('SELECT pg_backend_pid()')
+            ready << true
+            barrier.pop
+            RedmineSlack::AvatarCache.request_refresh(user_id, 'URACE0001')
+          end
+        end
+      end
+    end
+    THREADS.times { ready.pop }
+    THREADS.times { barrier << true }
+    threads.each { |thread| assert thread.join(60), 'a refresh request did not finish' }
+    pids = Array.new(THREADS) { backends.pop }
+    assert_equal THREADS, pids.uniq.length, 'requests did not use independent connections'
+
+    assert_equal 1, rows.count
+    state = UserPreference.find_by!(user_id: user_id)[:rslack_avatar]
+    assert_equal rows.first.active_job_id, state[:job_id]
+    assert_equal 'URACE0001', state[:member_id]
+    assert_nil rows.first.finished_at
   end
 end
