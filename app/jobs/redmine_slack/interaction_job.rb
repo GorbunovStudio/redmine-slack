@@ -29,7 +29,7 @@ module RedmineSlack
       if stage == 'prepare'
         issue = manager.confirm(channel, root, issue_id)
         text = issue_id ? "Link to ##{issue.id}: #{issue.subject}?" : "Remove link to ##{issue.id}: #{issue.subject}?"
-        text += ' Existing messages will be imported.' if issue_id && metadata['import_existing']
+        text += "\n\nExisting messages will be imported." if issue_id && metadata['import_existing']
         view = AssociationModal.message(metadata, text, confirm: true, external_id: destination)
       else
         if issue_id

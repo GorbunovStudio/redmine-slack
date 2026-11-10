@@ -2357,6 +2357,13 @@ class SlackAssociationIngressSmokeTest < ActionDispatch::IntegrationTest
     request = SlackSmokeTransport.requests.fetch(0)
     assert request[:url].end_with?('views.open')
     view = JSON.parse(request[:body])['view']
+    history = view.fetch('blocks').find { |block| block['block_id'] == 'history' }
+    assert_equal 'actions', history['type']
+    refute history.key?('label')
+    refute history.key?('optional')
+    assert_equal 'checkboxes', history.dig('elements', 0, 'type')
+    assert_equal 'import', history.dig('elements', 0, 'action_id')
+    assert_equal 'Import existing messages', history.dig('elements', 0, 'options', 0, 'text', 'text')
     metadata = JSON.parse(view['private_metadata'])
     assert_equal '201.001', metadata['root']
     assert_equal 'UASSOCIATION', metadata['actor']
@@ -2417,6 +2424,14 @@ class SlackAssociationIngressSmokeTest < ActionDispatch::IntegrationTest
     assert_empty RedmineSlack::ThreadAssociation.where(channel_id: 'CASSOCIATION')
   end
 
+  def test_history_checkbox_actions_are_acknowledged_without_work
+    interaction({'type' => 'block_actions', 'user' => {'id' => 'UASSOCIATION'},
+      'actions' => [{'type' => 'checkboxes', 'block_id' => 'history', 'action_id' => 'import', 'selected_options' => [{'value' => 'yes'}]}]})
+    assert_response :success
+    assert_empty enqueued_jobs
+    assert_empty SlackSmokeTransport.requests
+  end
+
   def test_input_confirmation_resolves_actor_and_rechecks_before_apply
     interaction(shortcut)
     assert_response :success
@@ -2432,6 +2447,7 @@ class SlackAssociationIngressSmokeTest < ActionDispatch::IntegrationTest
     view = publish_submission(first_ack, before_ack: true)
     assert_equal 'redmine_slack_association_confirm', view['callback_id']
     assert_includes view.dig('blocks', 0, 'text', 'text'), @issue.subject
+    assert_includes view.dig('blocks', 0, 'text', 'text'), "?\n\nExisting messages will be imported."
     SlackSmokeTransport.responses = [[200, {ok: true, channel: {is_private: true, is_group: true}}.to_json, {}],
       [200, {ok: true, messages: [{ts: '201.001'}]}.to_json, {}]]
     payload['view'] = {'id' => 'VFIXTURE', 'callback_id' => 'redmine_slack_association_confirm', 'private_metadata' => view['private_metadata']}

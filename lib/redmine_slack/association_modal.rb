@@ -7,7 +7,7 @@ module RedmineSlack
         close: {type: 'plain_text', text: 'Cancel'},
         blocks: [
           {type: 'input', block_id: 'issue', optional: true, label: {type: 'plain_text', text: 'Issue number (leave blank to unlink)'}, element: {type: 'plain_text_input', action_id: 'number'}},
-          {type: 'input', block_id: 'history', optional: true, label: {type: 'plain_text', text: 'Existing discussion'}, element: {type: 'checkboxes', action_id: 'import', options: [{text: {type: 'plain_text', text: 'Import existing messages'}, value: 'yes'}]}}
+          {type: 'actions', block_id: 'history', elements: [{type: 'checkboxes', action_id: 'import', options: [{text: {type: 'plain_text', text: 'Import existing messages'}, value: 'yes'}]}]}
         ]
       }
     end
