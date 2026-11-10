@@ -27,6 +27,8 @@ A client discussion can start in Slack before its Redmine issue exists. Associat
 
 ## Impact
 
-- Plugin-local association model/migration, shared lifecycle/routing helpers, a signed interaction endpoint, a Redmine-authenticated API controller, existing-client extensions and queued history/indication work. Current routing/preview are inline in `app/jobs/redmine_slack/event_job.rb:39–65`; current import tracking is in `lib/redmine_slack/comment_importer.rb:11–55` and `db/migrate/001_create_redmine_slack_message_links.rb:3–9`.
-- Reuse the current identity resolver, preview composition, signature verification, importer and `slack` queue; do not change Redmine core or the background-jobs plugin. Their current integration points are `lib/redmine_slack/member_resolver.rb:33–47`, `app/controllers/redmine_slack/events_controller.rb:6–12`, and `init.rb:25–26,44`.
+Source citations in this section describe the starting integration at commit `ea9f54be00032003680ca8fc4c7705fb19095193`.
+
+- Plugin-local association model/migration, shared lifecycle/routing helpers, a signed interaction endpoint, a Redmine-authenticated API controller, existing-client extensions and queued history/indication work. Starting routing/preview are inline in `app/jobs/redmine_slack/event_job.rb:39–65`; import tracking is in `lib/redmine_slack/comment_importer.rb:11–55` and `db/migrate/001_create_redmine_slack_message_links.rb:3–9`.
+- Reuse the existing identity resolver, preview composition, signature verification, importer and `slack` queue; do not change Redmine core or the background-jobs plugin. Their starting integration points are `lib/redmine_slack/member_resolver.rb:33–47`, `app/controllers/redmine_slack/events_controller.rb:6–12`, and `init.rb:25–26,44`.
 - Document the new API permission, routes, migration, shortcut/interactivity setup and `commands`, `reactions:write`, `im:read` scopes. `groups:read` becomes relevant to source classification, not only conversion; existing history scopes remain required (`README.md:34–44,103–120`). Extend stubbed smoke/reload tests; no live Slack calls are part of automated validation.

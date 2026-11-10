@@ -109,7 +109,7 @@ Interaction requests SHALL verify the original raw-body signature and replay win
 #### Scenario: Signed form payload starts the flow
 - **WHEN** Slack sends a valid signed message-shortcut form request
 - **THEN** a generic modal can open promptly without disclosing issue/association details before authorization
-- **AND** slower lookups can update that view to an authorized confirmation after acknowledgement
+- **AND** slower lookups can publish an authorized confirmation into a distinct pushed working view without changing the original input view
 
 #### Scenario: Signature or replay check fails
 - **WHEN** an interaction has missing/invalid authentication or a timestamp outside the existing five-minute replay window
@@ -124,6 +124,38 @@ Interaction requests SHALL verify the original raw-body signature and replay win
 - **WHEN** a form interaction or new background operation is logged or fails
 - **THEN** raw `payload`, response URLs, credentials, message content and job arguments are not exposed
 - **AND** failures use the inherited sanitized classifications rather than raw Slack responses
+
+### Requirement: Keep asynchronous modal results ordered without replaying mutations
+Submission acknowledgements SHALL create distinct working destinations. Result publication MUST wait for its destination through bounded publication-only retries, so a late acknowledgement cannot overwrite confirmation, completion or unavailable feedback. Publication failures MUST NOT repeat association mutations or history/indication requests. Sources: D12 confirmed-flow baseline; Slack push/update contracts and inherited bounded retry policy.
+
+#### Scenario: Confirmation is ready before Slack applies the acknowledgement
+- **WHEN** queued prepare work finishes before Slack has created the pushed working view
+- **THEN** early publication targets only that new destination and receives not-found rather than replacing the submitted input view
+- **AND** a bounded queued publication retry can publish the authorized issue confirmation after creation, with no later working acknowledgement overwriting it
+
+#### Scenario: Apply completes before the completion destination exists
+- **WHEN** a confirmed authorized mutation succeeds but its result destination is not yet created, or publishing its result later times out or is rate limited
+- **THEN** only the prepared UI result is retried; the successful mutation and its requested history/indication work are not executed again by publication retries
+- **AND** successful publication after destination creation shows completion without a late acknowledgement replacing it with working status
+
+#### Scenario: Slack applies the acknowledgement before queued publication
+- **WHEN** the pushed working view already exists when a result publisher runs
+- **THEN** that result replaces only its own destination, without another push, an unnecessary synchronization wait or a parent-view replacement
+
+#### Scenario: Unavailable feedback races the acknowledgement
+- **WHEN** prepare or apply produces authorization, validation or readiness-unavailable feedback before Slack applies the submission acknowledgement
+- **THEN** the same ordered publication path delivers that feedback without exposing unauthorized issue details
+- **AND** the error path does not independently replace the submitted parent view
+
+#### Scenario: The destination never becomes available or has been closed
+- **WHEN** result publication continues to receive not-found for the newly pushed destination
+- **THEN** it exhausts the inherited bounded transient policy and stops with a safe diagnostic
+- **AND** it neither reopens a modal nor recreates an association, repeats a mutation or schedules new history/indication work
+
+#### Scenario: Close finishes the management flow within the stack limit
+- **WHEN** the user progresses from input to confirmation and then completion, or closes a working/confirmation/result view
+- **THEN** the flow uses at most three views and Close clears the whole management modal instead of exposing an earlier confirmation
+- **AND** closing before confirmation still causes no association mutation
 
 ### Requirement: Provide a source-keyed authenticated JSON API
 The API SHALL expose GET, PUT and DELETE `/redmine_slack/thread_association.json`. GET/DELETE MUST accept `channel_id` and `root_message_ts` query parameters; PUT MUST accept a `thread_association` JSON object containing those strings, `issue_id`, and optional `import_existing` defaulting false. Responses MUST expose the association, not Slack message content. Sources: D7, D10, D15–D16 and D12 API baseline; route shape is a design choice.

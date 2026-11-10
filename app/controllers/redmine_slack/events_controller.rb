@@ -3,15 +3,9 @@ module RedmineSlack
     skip_forgery_protection
 
     def create
-      secret = Setting.plugin_redmine_slack['signing_secret']
-      timestamp = request.headers['X-Slack-Request-Timestamp'].to_s
-      signature = request.headers['X-Slack-Signature'].to_s
-      body = request.raw_post
-      return head :forbidden if secret.blank? || !timestamp.match?(/\A\d+\z/) || (Time.now.to_i - timestamp.to_i).abs > 5.minutes
-      expected = "v0=#{OpenSSL::HMAC.hexdigest('SHA256', secret, "v0:#{timestamp}:#{body}")}"
-      return head :forbidden unless ActiveSupport::SecurityUtils.secure_compare(expected, signature)
+      return head :forbidden unless ::RedmineSlack::RequestSignature.valid?(request)
 
-      payload = JSON.parse(body)
+      payload = JSON.parse(request.raw_post)
       return head :bad_request unless payload.is_a?(Hash)
       case payload['type']
       when 'url_verification'

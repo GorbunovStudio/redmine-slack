@@ -51,6 +51,10 @@ class SlackReloadSmokeTest < Minitest::Test
     assert_equal 1, GorbunovStudioBackgroundJobs.instance_variable_get(:@dedicated_queues).fetch('slack')
     assert_kind_of Class, RedmineSlack::DeliveryJob
     assert_kind_of Class, RedmineSlack::AvatarRefreshJob
+    %w[ThreadAssociation AssociationManager AssociationModal InboundReadiness IssuePreview MessageTarget RequestSignature ThreadImportJob AssociationIndicationJob InteractionJob InteractionViewJob InteractionsController ThreadAssociationsController].each do |name|
+      assert_kind_of Class, "RedmineSlack::#{name}".constantize
+    end
+    assert_includes Rails.application.config.filter_parameters, :payload
     assert_equal 'slack', RedmineSlack::AvatarRefreshJob.queue_name
     patch = RedmineSlack::AvatarsHelperPatch
     assert_equal 1, AvatarsHelper.ancestors.count(patch), 'avatar helper patch is attached more than once'
