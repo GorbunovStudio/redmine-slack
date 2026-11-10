@@ -111,6 +111,7 @@ class SlackClientSmokeTest < ActiveSupport::TestCase
     @client.conversation_replies('CFIXTURE', '1731427200.000123', 'cursor-fixture')
     @client.add_reaction('CFIXTURE', '1731427200.000123')
     @client.remove_reaction('CFIXTURE', '1731427200.000123')
+    assert_equal %w[GET GET POST POST], SlackSmokeTransport.requests.map { |request| request[:method] }
     assert_equal({channel: 'CFIXTURE'}, SlackSmokeTransport.requests[0][:body])
     assert_equal({channel: 'CFIXTURE', ts: '1731427200.000123', cursor: 'cursor-fixture'}, SlackSmokeTransport.requests[1][:body])
     assert_equal '1731427200.000123', JSON.parse(SlackSmokeTransport.requests[2][:body])['timestamp']
@@ -407,11 +408,13 @@ class SlackAssociationBehaviorSmokeTest < SlackWorkflowSmokeTest
     association, created = manager.upsert(@channel, @root, @issue.id)
     assert created
     assert_equal @issue.id, association.reload.issue_id
+    assert_empty ActiveJob::Base.queue_adapter.enqueued_jobs.select { |job| job[:job] == RedmineSlack::ThreadImportJob }
     source_responses({'is_im' => true})
     _, created = manager.upsert(@channel, @root, @issue.id, import_existing: true)
     refute created
     [nil, 123, ''].each do |invalid|
       assert_raises(RedmineSlack::AssociationManager::InvalidSource) { manager.upsert(invalid, @root, @issue.id) }
+      assert_raises(RedmineSlack::AssociationManager::InvalidSource) { manager.upsert(@channel, invalid, @issue.id) }
     end
     source_responses({'is_channel' => true, 'is_private' => false})
     assert_raises(RedmineSlack::AssociationManager::InvalidSource) { manager.upsert('CPUBLIC', @root, @issue.id) }
@@ -444,6 +447,7 @@ class SlackAssociationBehaviorSmokeTest < SlackWorkflowSmokeTest
       assert_raises(RedmineSlack::AssociationManager::ImportNotReady) { manager.upsert(@channel, @root, @issue.id, import_existing: true) }
       assert_equal @issue.id, association.reload.issue_id
       assert_empty SlackSmokeTransport.requests
+      assert_empty ActiveJob::Base.queue_adapter.enqueued_jobs.select { |job| [RedmineSlack::ThreadImportJob, RedmineSlack::AssociationIndicationJob].include?(job[:job]) }
     end
     assert_equal association.id, manager.show(@channel, @root).id
     manager.remove(@channel, @root)
@@ -495,7 +499,7 @@ class SlackAssociationBehaviorSmokeTest < SlackWorkflowSmokeTest
   end
 
   def test_api_replacement_requires_permission_in_both_projects
-    other = Issue.joins(:project).where.not(project_id: @issue.project_id).first!
+    other = Issue.joins(:project).merge(Project.active).where.not(project_id: @issue.project_id).first!
     actor = User.new(login: 'slack-two-project-fixture', firstname: 'Slack', lastname: 'Projects',
       mail: 'slack-two-project-fixture@example.invalid', password: 'Fixture-Password-123', password_confirmation: 'Fixture-Password-123')
     actor.save!
@@ -534,13 +538,15 @@ class SlackAssociationBehaviorSmokeTest < SlackWorkflowSmokeTest
     RedmineSlack::MessageLink.create!(channel_id: @channel, message_ts: '200.002', deleted_at: Time.current)
     pages = [
       {ok: true, messages: [{'ts' => '200.001', 'user' => 'UASSOCIATION', 'text' => 'root'}, {'ts' => '200.002', 'user' => 'UASSOCIATION', 'text' => 'already deleted'}], response_metadata: {next_cursor: 'cursor-fixture'}},
-      {ok: true, messages: [{'ts' => '200.003', 'bot_id' => 'BFIXTURE', 'text' => 'bot'}, {'ts' => '200.004', 'user' => 'UASSOCIATION', 'text' => "##{@issue.id}+= marked"}], response_metadata: {next_cursor: ''}}
+      {ok: true, messages: [{'ts' => '200.003', 'bot_id' => 'BFIXTURE', 'text' => 'bot'}, {'ts' => '200.004', 'user' => 'UASSOCIATION', 'text' => "##{@issue.id}+= marked"}, {'ts' => '200.005', 'user' => 'UASSOCIATION', 'subtype' => 'unsupported', 'text' => 'unsupported'}], response_metadata: {next_cursor: ''}}
     ]
     SlackSmokeTransport.responses = pages.map { |page| [200, page.to_json, {}] }
     assert_difference 'RedmineSlack::MessageLink.count', 2 do
       RedmineSlack::ThreadImportJob.perform_now(@channel, @root, @issue.id)
     end
     assert_equal %w[200.001 200.002 200.004], RedmineSlack::MessageLink.where(channel_id: @channel).order(:message_ts).pluck(:message_ts)
+    links = RedmineSlack::MessageLink.where(channel_id: @channel, message_ts: %w[200.001 200.004]).order(:message_ts).to_a
+    assert_operator links.first.journal_id, :<, links.last.journal_id
     assert_equal 'cursor-fixture', SlackSmokeTransport.requests.last[:body][:cursor]
     assert SlackSmokeTransport.requests.all? { |request| request[:url].end_with?('conversations.replies') }
     SlackSmokeTransport.responses = pages.map { |page| [200, page.to_json, {}] }
@@ -564,8 +570,26 @@ class SlackAssociationBehaviorSmokeTest < SlackWorkflowSmokeTest
     end
   end
 
+  def test_history_and_event_overlap_and_current_target_after_reassignment
+    other = Issue.joins(:project).merge(Project.active).where.not(id: @issue.id).first!
+    association = RedmineSlack::ThreadAssociation.create!(channel_id: @channel, root_message_ts: @root, issue_id: @issue.id)
+    event = {'type' => 'message', 'channel_type' => 'group', 'channel' => @channel, 'thread_ts' => @root,
+      'ts' => '205.010', 'user' => 'UASSOCIATION', 'text' => 'original reply'}
+    RedmineSlack::EventJob.perform_now(event)
+    original = RedmineSlack::MessageLink.find_by!(channel_id: @channel, message_ts: event['ts'])
+    association.update!(issue_id: other.id)
+    SlackSmokeTransport.responses = [[200, {ok: true, messages: [{ts: event['ts'], user: event['user'], text: 'original reply'}]}.to_json, {}]]
+    assert_no_difference ['Journal.count', 'RedmineSlack::MessageLink.count', 'Attachment.count'] do
+      RedmineSlack::ThreadImportJob.perform_now(@channel, @root, other.id)
+    end
+    assert_equal @issue.id, Journal.find(original.journal_id).journalized_id
+    RedmineSlack::EventJob.perform_now(event.merge('ts' => '205.011', 'text' => 'new reply'))
+    current = RedmineSlack::MessageLink.find_by!(channel_id: @channel, message_ts: '205.011')
+    assert_equal other.id, Journal.find(current.journal_id).journalized_id
+  end
+
   def test_first_history_marker_overrides_selected_issue
-    other = Issue.where.not(id: @issue.id).first!
+    other = Issue.joins(:project).merge(Project.active).where.not(id: @issue.id).first!
     message = {ts: '207.001', user: 'UASSOCIATION', text: "##{other.id}+= first ##{@issue.id}+= second"}
     SlackSmokeTransport.responses = [[200, {ok: true, messages: [message]}.to_json, {}]]
     RedmineSlack::ThreadImportJob.perform_now(@channel, @root, @issue.id)
@@ -605,6 +629,8 @@ class SlackAssociationBehaviorSmokeTest < SlackWorkflowSmokeTest
     assert_equal @root, payload['thread_ts']
     assert_equal false, payload['unfurl_links']
     assert_equal false, payload['unfurl_media']
+    RedmineSlack::AssociationIndicationJob.perform_now('upsert', @channel, @root, @issue.id)
+    assert_equal %w[reactions.add chat.postMessage reactions.add chat.postMessage], SlackSmokeTransport.requests.map { |request| request[:url].split('/').last }
     SlackSmokeTransport.requests.clear
     RedmineSlack::AssociationIndicationJob.perform_now('remove', @channel, @root)
     assert SlackSmokeTransport.requests.last[:url].end_with?('reactions.remove')
@@ -613,6 +639,8 @@ class SlackAssociationBehaviorSmokeTest < SlackWorkflowSmokeTest
     RedmineSlack::AssociationIndicationJob.perform_now('upsert', @channel, @root, @issue.id)
     RedmineSlack::ThreadImportJob.perform_now(@channel, @root, @issue.id)
     assert_empty SlackSmokeTransport.requests
+    Setting.plugin_redmine_slack = @settings
+    assert_empty ActiveJob::Base.queue_adapter.enqueued_jobs.select { |job| [RedmineSlack::ThreadImportJob, RedmineSlack::AssociationIndicationJob].include?(job[:job]) }
   end
 
   def test_indication_failure_preserves_state_and_invisible_issue_has_no_preview
@@ -2340,6 +2368,7 @@ class SlackAssociationIngressSmokeTest < ActionDispatch::IntegrationTest
     calls = []
     deadlines = []
     inside_timeout = false
+    original_timeout = Timeout.method(:timeout)
     fake = Object.new
     fake.define_singleton_method(:open_view) do |trigger, view|
       calls << [trigger, view]
@@ -2356,7 +2385,9 @@ class SlackAssociationIngressSmokeTest < ActionDispatch::IntegrationTest
       end
     end
     client = ->(*) { raise 'Client initialized outside opening deadline' unless inside_timeout; fake }
-    Timeout.stub(:timeout, timer) { RedmineSlack::Client.stub(:new, client) { interaction(shortcut) } }
+    Timeout.define_singleton_method(:timeout, &timer)
+    RedmineSlack::Client.define_singleton_method(:new, &client)
+    interaction(shortcut)
     assert_response :success
     assert_equal 1, calls.size
     assert_equal 'trigger-fixture', calls.first[0]
@@ -2364,13 +2395,16 @@ class SlackAssociationIngressSmokeTest < ActionDispatch::IntegrationTest
     assert_operator deadlines.first, :<=, 2.5
     assert_empty enqueued_jobs
     assert_empty RedmineSlack::ThreadAssociation.where(channel_id: 'CASSOCIATION')
-    Timeout.stub(:timeout, timer) { RedmineSlack::Client.stub(:new, client) { interaction(shortcut) } }
+    interaction(shortcut)
     assert_response :success
     assert_equal 2, calls.size
     assert_equal 2, deadlines.size
     assert_operator deadlines.last, :>, 0
     assert_operator deadlines.last, :<=, 2.5
     assert_empty enqueued_jobs
+  ensure
+    Timeout.define_singleton_method(:timeout, original_timeout) if original_timeout
+    RedmineSlack::Client.singleton_class.remove_method(:new) if RedmineSlack::Client.singleton_class.instance_methods(false).include?(:new)
   end
 
   def test_shortcut_opens_while_history_work_is_already_waiting
@@ -2426,7 +2460,7 @@ class SlackAssociationIngressSmokeTest < ActionDispatch::IntegrationTest
     link = RedmineSlack::MessageLink.find_by!(channel_id: 'CASSOCIATION', message_ts: '201.003')
     journal = Journal.find(link.journal_id)
     assert_equal @issue.id, journal.journalized_id
-    other = Issue.where.not(id: @issue.id).first!
+    other = Issue.joins(:project).merge(Project.active).where.not(id: @issue.id).first!
     SlackSmokeTransport.responses = [[200, {ok: true, channel: {is_private: true, is_group: true}}.to_json, {}],
       [200, {ok: true, messages: [{ts: '201.001'}]}.to_json, {}]]
     manager = RedmineSlack::AssociationManager.new(@actor)
@@ -2476,18 +2510,27 @@ class SlackAssociationIngressSmokeTest < ActionDispatch::IntegrationTest
     put url, params: {thread_association: tuple.merge(issue_id: @issue.id)}.to_json, headers: headers
     assert_response :created
     assert_equal tuple[:root_message_ts], JSON.parse(response.body).dig('thread_association', 'root_message_ts')
+    assert_equal %w[channel_id issue_id root_message_ts], JSON.parse(response.body).fetch('thread_association').keys.sort
+    assert_empty enqueued_jobs.select { |job| job[:job] == RedmineSlack::ThreadImportJob }
     SlackSmokeTransport.responses = [[200, {ok: true, channel: {is_im: true}}.to_json, {}], [200, {ok: true, messages: [{ts: tuple[:root_message_ts]}]}.to_json, {}]]
     put url, params: {thread_association: tuple.merge(issue_id: @issue.id, import_existing: true)}.to_json, headers: headers
     assert_response :success
+    assert_equal 1, enqueued_jobs.count { |job| job[:job] == RedmineSlack::ThreadImportJob }
     Setting.plugin_redmine_slack = @settings.merge('bot_token' => '')
     SlackSmokeTransport.requests.clear
+    enqueued_jobs.clear
     get url, params: tuple, headers: {'X-Redmine-API-Key' => @actor.api_key}
     assert_response :success
     put url, params: {thread_association: tuple.merge(issue_id: @issue.id)}.to_json, headers: headers
     assert_response :conflict
+    put url, params: {thread_association: tuple.merge(channel_id: 'CUNREADY', issue_id: @issue.id)}.to_json, headers: headers
+    assert_response :conflict
+    assert_empty enqueued_jobs
     delete url, params: tuple, headers: {'X-Redmine-API-Key' => @actor.api_key}
     assert_response :no_content
     get url, params: tuple, headers: {'X-Redmine-API-Key' => @actor.api_key}
+    assert_response :not_found
+    delete url, params: tuple, headers: {'X-Redmine-API-Key' => @actor.api_key}
     assert_response :not_found
     assert_empty SlackSmokeTransport.requests
   end
@@ -2498,6 +2541,11 @@ class SlackAssociationIngressSmokeTest < ActionDispatch::IntegrationTest
     put url, params: {thread_association: {channel_id: 123, root_message_ts: '202.001', issue_id: @issue.id}}.to_json, headers: headers
     assert_response :unprocessable_entity
     assert_equal 'invalid_source', JSON.parse(response.body)['error']
+    [{root_message_ts: '202.001'}, {channel_id: 'CAPI'}, {channel_id: 'CAPI', root_message_ts: 123}].each do |source|
+      put url, params: {thread_association: source.merge(issue_id: @issue.id)}.to_json, headers: headers
+      assert_response :unprocessable_entity
+      assert_equal 'invalid_source', JSON.parse(response.body)['error']
+    end
     SlackSmokeTransport.responses = [[200, '{"ok":false,"error":"invalid_auth"}', {}]]
     put url, params: {thread_association: {channel_id: 'CAPI', root_message_ts: '202.001', issue_id: @issue.id}}.to_json, headers: headers
     assert_response :unprocessable_entity
@@ -2531,7 +2579,7 @@ class SlackAssociationIngressSmokeTest < ActionDispatch::IntegrationTest
   end
 
   def test_api_change_requires_project_permission_on_both_sides
-    other = Issue.joins(:project).where.not(project_id: @issue.project_id).first!
+    other = Issue.joins(:project).merge(Project.active).where.not(project_id: @issue.project_id).first!
     user = User.new(login: 'slack-api-projects-fixture', firstname: 'Slack', lastname: 'Projects',
       mail: 'slack-api-projects-fixture@example.invalid', password: 'Fixture-Password-123', password_confirmation: 'Fixture-Password-123')
     user.save!
