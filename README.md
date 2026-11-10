@@ -25,7 +25,7 @@ Install `00_gorbunovstudio_background_jobs` version `1.1.0` or newer at
 `plugins/redmine_slack`. This plugin reserves one thread using the background
 jobs dedicated `slack` queue hook; it does not change the shared thread budget.
 Run the plugin migration from the Redmine root to create the Slack message link
-table, then restart Redmine so that queue registration takes effect:
+and thread association tables, then restart Redmine so that queue registration takes effect:
 
 ```sh
 RAILS_ENV=production bundle exec rake redmine:plugins:migrate NAME=redmine_slack
@@ -33,7 +33,7 @@ RAILS_ENV=production bundle exec rake redmine:plugins:migrate NAME=redmine_slack
 
 Create a Slack app, install it in the workspace, and grant these bot scopes:
 `chat:write`, `chat:write.customize`, `users:read.email`, `im:write`, `files:write`, and
-`groups:read` (used only for channel conversion). `chat:write.public` is not
+`groups:read` (used for channel conversion and association source classification). `chat:write.public` is not
 required. Scope changes require reinstalling the app. Enable the App Home Messages
 Tab; replies can remain disabled for outbound-only use, but enable them to use
 inbound app DMs.
@@ -118,6 +118,58 @@ notes, and attachment access where files are expected. **Enable Slack import**
 defaults off and is independent of outbound delivery; keep it off until the
 cutover. When enabling it, disable only Hubot's preview, thread, and `#N+=`
 listeners; leave Hubot's other commands and scheduled reports running.
+
+## Slack thread associations
+
+Configure the Slack interactivity request URL as
+`https://redmine.gorbunov.studio/redmine_slack/interactions`, and create a
+message shortcut with callback ID `redmine_slack_manage_thread`. Add bot scopes
+`commands`, `reactions:write`, and `im:read`, retain `groups:read`,
+`groups:history`, and `im:history`, and reinstall the app. Keep the existing
+Events API URL and subscriptions. The bot classifies the source conversation;
+it does not verify the invoker's membership in that conversation.
+
+Use the shortcut on a root or reply to choose an issue and optionally import the
+existing discussion. Confirm the issue title before saving; leave the issue
+number blank to remove an association. The invoking Slack member must map to an
+active Redmine account able to view the relevant issue and add notes. Changing
+an association requires these rights on both issues. These management rights
+are separate from the imported message author's permissions and attribution.
+An issue can have multiple associated roots, but each root has one target.
+Close clears the whole management flow rather than returning to an earlier
+confirmation.
+
+History is optional and is processed chronologically across pages. Previously
+imported message identifiers, including those linked to another issue, are
+skipped. Bot messages are not imported. Changing or removing an association does
+not move or delete old comments, attachments, or their links; subsequent edits
+and deletions still synchronize the original comments. Enabling import later
+does not replay history or indication work discarded while import was disabled.
+
+For API access, enable the Redmine REST API and grant project roles **Manage Slack
+associations via API** in every relevant project. This permission applies only to
+the API, not the Slack shortcut. Inspection also requires issue
+visibility; mutations require visibility and add-notes. Create/change require
+inbound import enabled, a signing secret, bot token, and an active configured
+import user, independent of outbound delivery. Authorized inspection and removal
+still work without Slack while import is disabled or incomplete.
+
+```sh
+curl -X PUT "$REDMINE_URL/redmine_slack/thread_association.json" \
+  -H "X-Redmine-API-Key: $REDMINE_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"thread_association":{"channel_id":"CFIXTURE","root_message_ts":"1731427200.000123","issue_id":123,"import_existing":true}}'
+curl --get "$REDMINE_URL/redmine_slack/thread_association.json" \
+  -H "X-Redmine-API-Key: $REDMINE_API_KEY" \
+  --data-urlencode 'channel_id=CFIXTURE' --data-urlencode 'root_message_ts=1731427200.000123'
+curl -X DELETE "$REDMINE_URL/redmine_slack/thread_association.json?channel_id=CFIXTURE&root_message_ts=1731427200.000123" \
+  -H "X-Redmine-API-Key: $REDMINE_API_KEY"
+```
+
+Omitting `import_existing` defaults it to false. API success reports saved
+association state; history and Slack reactions/previews run asynchronously.
+The preview includes the existing full issue description for Slack participants.
+Provider failures and retries can leave stale indication or repeat previews;
+there is no automatic reconciliation or preview deduplication.
 
 For inbound rollback, disable import and leave the event job in place until
 queued work has consumed the disabled state. Remove the Slack subscription before

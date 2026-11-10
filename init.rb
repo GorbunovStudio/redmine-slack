@@ -1,6 +1,6 @@
 require 'redmine'
 
-Rails.application.config.filter_parameters |= [:bot_token, :signing_secret, :event]
+Rails.application.config.filter_parameters |= [:bot_token, :signing_secret, :event, :payload]
 
 prepare_patches = proc do
 	User.include RedmineSlack::UserPatch unless User < RedmineSlack::UserPatch
@@ -24,6 +24,7 @@ Redmine::Plugin.register :redmine_slack do
 
 	requires_redmine :version_or_higher => '7.0.0'
 	requires_redmine_plugin :'00_gorbunovstudio_background_jobs', :version_or_higher => '1.1.0'
+	permission :manage_slack_associations_via_api, {}, :require => :member
 
 	settings \
 		:default => {

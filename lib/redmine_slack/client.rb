@@ -29,6 +29,36 @@ module RedmineSlack
       Array(result['messages']).find { |message| message['ts'] == timestamp }
     end
 
+    def conversation_info(channel)
+      request(:get, 'conversations.info', channel: channel)['channel']
+    end
+
+    def conversation_replies(channel, timestamp, cursor = nil)
+      query = {channel: channel, ts: timestamp}
+      query[:cursor] = cursor if cursor.present?
+      request(:get, 'conversations.replies', query)
+    end
+
+    def open_view(trigger_id, view)
+      request(:post, 'views.open', trigger_id: trigger_id, view: view)
+    end
+
+    def update_view(external_id, view)
+      request(:post, 'views.update', external_id: external_id, view: view)
+    end
+
+    def add_reaction(channel, timestamp)
+      request(:post, 'reactions.add', channel: channel, timestamp: timestamp, name: 'ticket')
+    rescue DropError => error
+      raise unless error.message == 'already_reacted'
+    end
+
+    def remove_reaction(channel, timestamp)
+      request(:post, 'reactions.remove', channel: channel, timestamp: timestamp, name: 'ticket')
+    rescue DropError => error
+      raise unless error.message == 'no_reaction'
+    end
+
     def file_info(file_id)
       request(:get, 'files.info', file: file_id)['file']
     end

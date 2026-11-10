@@ -1,1 +1,5 @@
 post 'redmine_slack/events', to: 'redmine_slack/events#create'
+post 'redmine_slack/interactions', to: 'redmine_slack/interactions#create'
+get 'redmine_slack/thread_association', to: 'redmine_slack/thread_associations#show'
+put 'redmine_slack/thread_association', to: 'redmine_slack/thread_associations#update'
+delete 'redmine_slack/thread_association', to: 'redmine_slack/thread_associations#destroy'
